@@ -53,6 +53,7 @@ export const store = {
   channelAssignments: {},
   sensorProfiles: [],
   mapSensors: [],
+  commands: [],           // recent downward commands, keyed by cid (cmd↔ack)
   ready: false,
 };
 
@@ -142,6 +143,8 @@ export async function hydrate() {
       value: r.last_value,
       code: 0,
       status: r.last_status ?? 'Offline',
+      connState: r.active_flag ? 'CONNECTED' : 'DISCONNECTED',
+      masked: false,
       lastSeen: null,          // no live telemetry yet this process
       history: [],             // filled by loadHistory() below
     });
@@ -201,6 +204,7 @@ export async function hydrate() {
 
   rebuildChannelAssignments();
   await loadMapSensors();
+  await loadCommands();
 
   store.ready = true;
   const nPorts = store.devices.reduce(
@@ -243,6 +247,39 @@ async function loadMapSensors() {
     deviceId: deviceKey(r.slug, r.node_id),
     moduleId: r.i2c_address,
     portId: r.port_code,
+  }));
+}
+
+// Recent downward commands + their latest ack status (cmd↔ack correlation).
+const COMMAND_CAP = Number(process.env.COMMAND_CAP ?? 100);
+async function loadCommands() {
+  let rows;
+  try {
+    ({ rows } = await adminPool.query(`
+      SELECT c.command_id, c.cid, c.action, c.mode, c.port, c.payload,
+             c.status, c.msg, c.created_at, c.acked_at,
+             t.slug, d.node_id
+      FROM commands c
+      JOIN tenants t ON t.tenant_id = c.tenant_id
+      JOIN devices d ON d.device_id = c.device_id
+      ORDER BY c.created_at DESC
+      LIMIT $1`, [COMMAND_CAP]));
+  } catch (e) {
+    // Not-yet-migrated DB (migration 1730000000003) — boot with no command log.
+    if (e.code === '42P01') {
+      console.warn('[store] commands table missing — run migration 1730000000003; command log disabled');
+      store.commands = [];
+      return;
+    }
+    throw e;
+  }
+  store.commands = rows.map((c) => ({
+    id: c.command_id, cid: c.cid, tenantId: c.slug,
+    deviceId: deviceKey(c.slug, c.node_id),
+    action: c.action, mode: c.mode, port: c.port,
+    payload: c.payload, status: c.status, msg: c.msg,
+    createdAt: new Date(c.created_at).getTime(),
+    ackedAt: c.acked_at ? new Date(c.acked_at).getTime() : null,
   }));
 }
 
@@ -327,6 +364,133 @@ function deviceOfPort(port) {
     for (const m of d.modules)
       if (m.ports.includes(port)) return d;
   return null;
+}
+
+// Persist a port's discovery-derived active_flag (fire-and-forget).
+export async function persistPortActive(port, attached) {
+  const dev = deviceOfPort(port);
+  if (!dev) return;
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query(`UPDATE ports SET active_flag=$2 WHERE port_id=$1`, [port._uuid, attached]));
+}
+
+// ── Actuators + commands + ack correlation ──────────────────────────────────
+const portNumOf = (p) => {
+  const m = String(p).match(/(\d+)/);
+  return m ? Number(m[1]) : NaN;
+};
+
+export function findActuator(node, idOrPort) {
+  const acts = node?.actuators ?? [];
+  const asNum = portNumOf(idOrPort);
+  return (
+    acts.find((a) => a.id === idOrPort) ??
+    acts.find((a) => portNumOf(a.port) === asNum) ??
+    null
+  );
+}
+
+// Insert a downward command as it's published, so the ack can later find it by
+// cid. Returns the cache record.
+export async function recordCommand(dev, envelope) {
+  const { rows } = await withTenant(dev._tenantUuid, (c) =>
+    c.query(
+      `INSERT INTO commands(tenant_id, device_id, cid, action, mode, port, payload, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+       RETURNING command_id, created_at`,
+      [dev._tenantUuid, dev._uuid, envelope.cid, envelope.action,
+       envelope.mode ?? null, envelope.port ?? null, JSON.stringify(envelope)]
+    ));
+  const rec = {
+    id: rows[0].command_id, cid: envelope.cid, tenantId: dev.tenantId,
+    deviceId: dev.id, action: envelope.action, mode: envelope.mode ?? null,
+    port: envelope.port ?? null, payload: envelope, status: 'pending', msg: null,
+    createdAt: new Date(rows[0].created_at).getTime(), ackedAt: null,
+  };
+  store.commands.unshift(rec);
+  if (store.commands.length > COMMAND_CAP) store.commands.length = COMMAND_CAP;
+  return rec;
+}
+
+// Update a command's lifecycle status from an incoming ack. Returns the cache
+// record (with .action/.port) so ingest can reflect it on the actuator.
+export function updateCommandStatus(cid, status, msg, terminal = false) {
+  const rec = store.commands.find((c) => c.cid === cid);
+  if (rec) {
+    rec.status = status;
+    rec.msg = msg;
+    if (terminal) rec.ackedAt = Date.now();
+  }
+  // Persist without blocking ingest. We know the tenant from the cache record;
+  // if the command wasn't in cache (e.g. issued before restart), skip the DB.
+  const t = rec ? store.tenants[rec.tenantId] : null;
+  if (t) {
+    withTenant(t.id, (c) =>
+      c.query(
+        `UPDATE commands
+         SET status=$2, msg=$3, acked_at = CASE WHEN $4 THEN now() ELSE acked_at END
+         WHERE cid=$1`,
+        [cid, status, msg, terminal]
+      )).catch((e) => console.error('[store] persist ack failed:', e.message));
+  }
+  return rec ?? null;
+}
+
+// Reflect an ack (or an optimistic send) on the target actuator: last_ack, and
+// optionally state. Updates cache + DB. `patch` = { status, state? }.
+export function setActuatorAck(node, idOrPort, patch = {}) {
+  const act = findActuator(node, idOrPort);
+  if (!act) return null;
+  if (patch.status != null) act.lastAck = patch.status;
+  if (patch.state != null) act.state = patch.state ? 1 : 0;
+  act.updatedAt = Date.now();
+
+  persistActuator(node, act).catch((e) =>
+    console.error('[store] persist actuator failed:', e.message));
+  return act;
+}
+
+// Optimistically apply an actuate command's intent to the actuator at send time
+// (before the ack arrives): mode/state/duty/dur + last_ack='pending'.
+export function applyActuatorCommand(node, idOrPort, out = {}) {
+  const act = findActuator(node, idOrPort);
+  if (!act) return null;
+  if (out.mode === 'bin' || out.mode === 'pwm') act.mode = out.mode;
+  if (out.state != null) act.state = out.state ? 1 : 0;
+  if (act.mode === 'pwm' && out.duty != null) {
+    act.duty = Math.min(255, Math.max(0, Math.round(Number(out.duty) || 0)));
+  }
+  if (out.dur != null) act.dur = Math.max(0, Math.round(Number(out.dur) || 0));
+  act.lastAck = 'pending';
+  act.updatedAt = Date.now();
+
+  persistActuator(node, act).catch((e) =>
+    console.error('[store] persist actuator failed:', e.message));
+  return act;
+}
+
+async function persistActuator(node, act) {
+  await withTenant(node._tenantUuid, (c) =>
+    c.query(
+      `UPDATE actuators SET mode=$3, state=$4, duty=$5, dur=$6, last_ack=$7
+       WHERE device_id=$1 AND actuator_code=$2`,
+      [node._uuid, act.id, act.mode, act.state, act.duty, act.dur, act.lastAck]
+    ));
+}
+
+// Insert a notification (e.g. on command failure). Scoped to the node's tenant.
+export async function addNotification(node, { type, title, message }) {
+  const { rows } = await withTenant(node._tenantUuid, (c) =>
+    c.query(
+      `INSERT INTO notifications(tenant_id, type, title, message)
+       VALUES ($1,$2,$3,$4) RETURNING notification_id, created_at`,
+      [node._tenantUuid, type, title, message]
+    ));
+  store.notifications.unshift({
+    id: rows[0].notification_id, tenantId: node.tenantId, type, title, message,
+    time: fmtTs(new Date(rows[0].created_at)), read: false,
+  });
+  return rows[0].notification_id;
 }
 
 // ── Persisted mutations used by routes.js ───────────────────────────────────
@@ -461,6 +625,7 @@ export function projectDevices(tenantId = null) {
           value: p.value, rangeMin: p.rangeMin, rangeMax: p.rangeMax,
           safeMin: p.safeMin, safeMax: p.safeMax,
           status: p.status, history: p.history,
+          activeFlag: p.activeFlag, connState: p.connState ?? null, masked: !!p.masked,
         })),
       })),
       actuators: d.actuators ?? [],

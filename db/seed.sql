@@ -81,9 +81,9 @@ BEGIN
 
   -- actuators (on N001 mainboard)
   INSERT INTO actuators(device_id, tenant_id, actuator_code, name, port, channel, gpio, mode, state, duty, dur, last_ack) VALUES
-    (v_n1, v_aqua, 'fan01','Circulation Fan','OUT1',0,25,'pwm',   1,65,0,'ok'),
-    (v_n1, v_aqua, 'htr01','Water Heater',   'OUT2',1,26,'binary',0, 0,0,'ok'),
-    (v_n1, v_aqua, 'aer01','Aerator Pump',   'OUT3',2,27,'pwm',   0,40,0,'pending')
+    (v_n1, v_aqua, 'fan01','Circulation Fan','OUT1',0,25,'pwm',   1,166,0,'success'),
+    (v_n1, v_aqua, 'htr01','Water Heater',   'OUT2',1,26,'bin',   0,  0,0,'success'),
+    (v_n1, v_aqua, 'aer01','Aerator Pump',   'OUT3',2,27,'pwm',   0,102,0,'pending')
   ON CONFLICT (device_id, port) DO NOTHING;
 
   -- a couple of notifications

@@ -1,28 +1,20 @@
 // ingest.js ─────────────────────────────────────────────────────────────────
-// Turns raw wire-protocol packets into updated state. Verified against the
-// ACTUAL firmware (SENSEable-HW/blink/main/blink_example_main.c).
+// Turns raw wire-protocol packets into updated state. Aligned with the FROZEN
+// "Payload Schemas" spec (Sasil / Hatulan) and SENSEable-HW's MQTT scripts.
 //
-// FIXES vs the previous version:
-//   1. Discovery packet type is 't':'disco' — the old code checked for 'dsc',
-//      so EVERY discovery packet was rejected ("not a discovery packet").
-//   2. Discovery carries a TOPOLOGY BITMAP (+ detected_chips), not a `modules`
-//      array. Bit layout from the firmware's disco task:
-//         bit 0        chip 0 online
-//         bits 1..4    chip 0 ports 0..3 attached
-//         bit 5        chip 1 online
-//         bits 6..9    chip 1 ports 0..3 attached
-//         ... (5 bits per chip, 4 chips => 20 bits)
-//   3. Telemetry now resolves the tenant from `tid` BEFORE matching `nid`.
-//      The old code matched nid alone, so any node claiming "N001" wrote into
-//      whichever tenant happened to own N001 — a cross-tenant write.
-//   4. The raw ADC count is stashed on the port so store.js can persist it
-//      (the frozen protocol says the node ships raw counts; the DB keeps them).
+//   tlm    usc/thesis/{tid}/{nid}/tlm    raw ADC + per-port status codes
+//   disco  usc/thesis/{tid}/{nid}/disco  per-chip port connection map
+//   ack    usc/thesis/{tid}/{nid}/ack    command lifecycle feedback (cid-keyed)
+//
+// Everything resolves the tenant from `tid` (→ tenants.mqtt_tid) BEFORE matching
+// `nid`, so a node claiming "N001" can never write into another tenant's device.
 
 import {
   store, findNode, findNodeScoped, findPortByChannel, pushHistory,
-  applyCalibration, persistDeviceState,
+  applyCalibration, persistDeviceState, persistPortActive,
+  updateCommandStatus, setActuatorAck, addNotification,
 } from './store.js';
-import { derivePortStatus, deriveNodeStatus } from './status.js';
+import { derivePortStatus, deriveNodeStatus, describeConnState } from './status.js';
 
 // '48' | '0X4A' -> '0x4a'
 function normAddr(a) {
@@ -30,13 +22,10 @@ function normAddr(a) {
   return s.startsWith('0x') ? s : `0x${s}`;
 }
 
-// Reject packets whose tenant can't be resolved. Default ON — a node whose
-// `tid` isn't mapped in tenants.mqtt_tid must NOT be allowed to write into a
-// tenant picked by nid alone (that's a cross-tenant write). Set
+// Reject packets whose tenant can't be resolved. Default ON. Set
 // INGEST_STRICT_TENANT=false only for a single-tenant bring-up bench.
 const STRICT_TENANT = process.env.INGEST_STRICT_TENANT !== 'false';
 
-// Resolve the node a packet belongs to, tenant-first.
 function resolvePacketNode(pkt) {
   const scoped = findNodeScoped(pkt.tid, pkt.nid);
   if (scoped) return { node: scoped, scoped: true, error: null };
@@ -55,8 +44,6 @@ function resolvePacketNode(pkt) {
     return { node: findNode(pkt.nid), scoped: false, error: null };
   }
 
-  // Tenant is known but has no such node — a real "unknown node", not a
-  // tenancy problem.
   return { node: null, scoped: false, error: `node '${pkt.nid}' not registered to tid '${pkt.tid}'` };
 }
 
@@ -71,8 +58,8 @@ export function ingestTelemetry(pkt) {
   const now = Date.now();
   node.lastSeen = now;
 
-  // Node-level status block (st) — the current firmware doesn't send one, so
-  // these stay at their hydrated values. Kept for the frozen spec's sake.
+  // Optional node-level status block (the frozen tlm schema has no `st`; kept
+  // tolerant in case the firmware adds one later).
   if (pkt.st && typeof pkt.st === 'object') {
     if (Number.isFinite(pkt.st.up)) node.uptime = pkt.st.up;
     if (Number.isFinite(pkt.st.rs)) node.rssi = pkt.st.rs;
@@ -92,8 +79,7 @@ export function ingestTelemetry(pkt) {
       port.raw = raw;              // frozen protocol: keep the raw count
       port.lastSeen = now;
 
-      // All engineering-unit conversion happens HERE, server-side. The node
-      // never sends a calibrated value.
+      // All engineering-unit conversion happens HERE, server-side.
       const value = applyCalibration(raw, port.calibration);
       if (value != null) port.value = value;
 
@@ -116,68 +102,106 @@ export function ingestTelemetry(pkt) {
 }
 
 // --- Discovery ('disco') ----------------------------------------------------
-// The firmware publishes its I2C topology as a bitmap. We decode it and mark
-// ports active/inactive — this is the "newly detected ports appear as
-// unconfigured resources" behavior from the thesis.
-const CHIPS = 4, CHANNELS = 4;
-
-export function decodeTopology(bitmap) {
-  const chips = [];
-  let bit = 0;
-  for (let c = 0; c < CHIPS; c++) {
-    const online = Boolean((bitmap >> bit) & 1);
-    bit++;
-    const ports = [];
-    for (let ch = 0; ch < CHANNELS; ch++) {
-      ports.push(Boolean((bitmap >> bit) & 1));
-      bit++;
-    }
-    chips.push({ online, ports });
-  }
-  return chips;
-}
-
+// Frozen schema: buses[] with a per-chip ports object p0..p3 whose values are
+// CONNECTED | DISCONNECTED | DISABLED. We map that onto each port's activeFlag
+// (has a live sensor) + connState (for the UI's "masked vs unplugged" nuance).
 export function ingestDiscovery(pkt) {
-  // The firmware sends 'disco'. 'dsc' accepted too, in case the frozen spec's
-  // shorter name is ever adopted.
-  if (!pkt || (pkt.t !== 'disco' && pkt.t !== 'dsc')) {
-    return { ok: false, error: 'not a discovery packet' };
-  }
+  if (!pkt || pkt.t !== 'disco') return { ok: false, error: 'not a discovery packet' };
 
-  const { node, error } = resolvePacketNode(pkt);
+  const { node, scoped, error } = resolvePacketNode(pkt);
   if (error) return { ok: false, error };
   if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
 
   node.lastSeen = Date.now();
-  if (pkt.net) node.commMode = pkt.net === 'cell' ? 'Cellular' : 'Wi-Fi';
 
-  let activated = 0, deactivated = 0;
+  let connected = 0, disconnected = 0, disabled = 0, unmatched = 0;
 
-  const bitmap = Number(pkt.topology ?? pkt.topo ?? 0);
-  if (bitmap) {
-    const chips = decodeTopology(bitmap);
-    // Chip index -> module. The firmware scans a fixed address list
-    // (0x48,0x49,0x4a,0x4b), so chip index i maps to that address.
-    const ADDRS = ['0x48', '0x49', '0x4a', '0x4b'];
-    chips.forEach((chip, i) => {
-      const mod = node.modules.find((m) => m.address.toLowerCase() === ADDRS[i]);
-      if (!mod) return;
-      chip.ports.forEach((attached, ch) => {
-        const port = mod.ports.find((p) => p.channel === ch);
-        if (!port) return;
-        if (port.activeFlag !== attached) {
-          port.activeFlag = attached;
-          attached ? activated++ : deactivated++;
-        }
-      });
-    });
+  for (const bus of pkt.buses ?? []) {
+    const addr = normAddr(bus.a);
+    const mod = node.modules.find((m) => m.address?.toLowerCase() === addr);
+    if (!mod) { unmatched++; continue; }
+
+    for (const [key, state] of Object.entries(bus.ports ?? {})) {
+      const ch = Number(String(key).replace(/^p/i, ''));   // 'p2' -> 2
+      const port = mod.ports.find((p) => p.channel === ch);
+      if (!port) { unmatched++; continue; }
+
+      const conn = describeConnState(state);
+      port.connState = conn.name;
+      port.masked = conn.masked;
+      if (port.activeFlag !== conn.attached) {
+        port.activeFlag = conn.attached;
+        persistPortActive(port, conn.attached).catch((e) =>
+          console.error('[ingest] persist active_flag failed:', e.message));
+      }
+
+      if (conn.name === 'CONNECTED') connected++;
+      else if (conn.name === 'DISABLED') disabled++;
+      else disconnected++;
+    }
   }
 
   refreshNodeStatus(node, Date.now());
   return {
-    ok: true, node: node.id,
+    ok: true, node: node.id, tenantScoped: scoped,
     detectedChips: pkt.detected_chips ?? null,
-    activated, deactivated,
+    connected, disconnected, disabled, unmatched,
+  };
+}
+
+// --- Acknowledgement ('ack') ------------------------------------------------
+// Closed-loop feedback for downward commands, correlated by `cid`. Updates the
+// command record's lifecycle status, reflects the result on the target actuator
+// (for `actuate`), and raises a notification on failure.
+//
+// status ∈ started | completed | stopped | failed | error | success
+const ACK_OK       = new Set(['started', 'completed', 'stopped', 'success']);
+const ACK_FAIL     = new Set(['failed', 'error']);
+// A command reaches a terminal state on these; actuator returns to ground on
+// completed/stopped (the timer elapsed or a manual stop overrode it).
+const ACK_TERMINAL = new Set(['completed', 'stopped', 'success', 'failed', 'error']);
+const ACK_GROUNDED = new Set(['completed', 'stopped']);
+
+export function ingestAck(pkt) {
+  if (!pkt || pkt.t !== 'ack') return { ok: false, error: 'not an ack packet' };
+  if (!pkt.cid) return { ok: false, error: 'ack missing cid' };
+
+  const { node, scoped, error } = resolvePacketNode(pkt);
+  if (error) return { ok: false, error };
+  if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
+
+  node.lastSeen = Date.now();
+
+  const status = String(pkt.status ?? '').toLowerCase();
+  const terminal = ACK_TERMINAL.has(status);
+
+  // 1. Update the command record (fire-and-forget persistence).
+  const cmd = updateCommandStatus(pkt.cid, status, pkt.msg ?? null, terminal);
+
+  // 2. Reflect on the target actuator, if this ack is for an actuate command.
+  let actuator = null;
+  const action = pkt.action ?? cmd?.action;
+  if (action === 'actuate' && cmd?.port != null) {
+    const patch = { status };
+    if (ACK_GROUNDED.has(status)) patch.state = 0; // timed run ended / stopped
+    actuator = setActuatorAck(node, cmd.port, patch);
+  }
+
+  // 3. Notify on failure so it surfaces in the Notifications page.
+  if (ACK_FAIL.has(status)) {
+    addNotification(node, {
+      type: 'fault',
+      title: `Command ${status}`,
+      message: pkt.msg || `Command ${pkt.cid} (${action ?? 'unknown'}) ${status}.`,
+    }).catch((e) => console.error('[ingest] ack notification failed:', e.message));
+  }
+
+  return {
+    ok: true, node: node.id, tenantScoped: scoped,
+    cid: pkt.cid, status,
+    matchedCommand: Boolean(cmd),
+    actuator: actuator?.id ?? null,
+    result: ACK_FAIL.has(status) ? 'fail' : (ACK_OK.has(status) ? 'ok' : 'unknown'),
   };
 }
 
@@ -199,7 +223,6 @@ export function refreshNodeStatus(node, now = Date.now()) {
   });
 }
 
-// Sweep every node so nodes flip to Offline when telemetry stops arriving.
 export function refreshAll(now = Date.now()) {
   for (const node of store.devices) refreshNodeStatus(node, now);
 }

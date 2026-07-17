@@ -38,6 +38,29 @@ export const assignChannel = (board, channel, formulaLabel) =>
   send('PUT', `/channel-assignments/${board}/${channel}`, { formulaLabel });
 export const saveMapSensors = (sensors) => send('PUT', '/map-sensors', sensors);
 
+// ── Downward commands (actuate / bus_recovery / sensor_port_up|down) ─────────
+// The backend resolves the broker `tid` from tenants.mqtt_tid, builds the exact
+// wire envelope, logs it (cid), and publishes to usc/thesis/{tid}/{nid}/cmd if a
+// broker is connected. It returns { ok, cid, topic, published, envelope }.
+export const sendCommand = (deviceId, action, params = {}) =>
+  send('POST', '/commands', { deviceId, action, ...params });
+
+// Actuate an output. Target by actuatorId (preferred) or a raw port (1..6 /
+// "OUT3"). mode 'bin' -> pass state 0|1; mode 'pwm' -> pass duty 0..255.
+export const actuate = (deviceId, { actuatorId, port, mode, state, duty, dur = 0 }) =>
+  sendCommand(deviceId, 'actuate', { actuatorId, port, mode, state, duty, dur });
+
+export const busRecovery = (deviceId, busId = 0) =>
+  sendCommand(deviceId, 'bus_recovery', { busId });
+
+// direction: 'up' (enable) | 'down' (disable). chip 0..3 (0x48..0x4B), ch 0..3.
+export const sensorPortToggle = (deviceId, direction, chip, ch) =>
+  sendCommand(deviceId, `sensor_port_${direction}`, { chip, ch });
+
+// Recent command log (with latest ack status), optionally scoped to one device.
+export const fetchCommands = (deviceId) =>
+  get(`/commands${deviceId ? `?device=${encodeURIComponent(deviceId)}` : ''}`);
+
 // Example wiring for DeviceOverview.jsx:
 //
 //   import { useEffect, useState } from 'react';

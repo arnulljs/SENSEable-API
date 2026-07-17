@@ -11,7 +11,7 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "simulate": "node scripts/simulate.js",
-    "check": "node --check src/server.js && node --check src/store.js && node --check src/calibration.js && node --check src/ingest.js && node --check src/status.js && node --check src/routes.js && node --check src/mqtt.js"
+    "check": "node --check src/server.js && node --check src/store.js && node --check src/calibration.js && node --check src/ingest.js && node --check src/status.js && node --check src/routes.js && node --check src/mqtt.js && node --check src/commands.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
