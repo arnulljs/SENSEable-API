@@ -38,6 +38,14 @@ export const assignChannel = (board, channel, formulaLabel) =>
   send('PUT', `/channel-assignments/${board}/${channel}`, { formulaLabel });
 export const saveMapSensors = (sensors) => send('PUT', '/map-sensors', sensors);
 
+// ── Renames (persist to the DB; response echoes the updated device) ─────────
+export const renameDevice = (deviceId, name) =>
+  send('PATCH', `/devices/${encodeURIComponent(deviceId)}`, { name });
+export const renameModule = (deviceId, moduleId, name) =>
+  send('PATCH', `/devices/${encodeURIComponent(deviceId)}/modules/${encodeURIComponent(moduleId)}`, { name });
+export const renameActuator = (deviceId, actuatorId, name) =>
+  send('PATCH', `/devices/${encodeURIComponent(deviceId)}/actuators/${encodeURIComponent(actuatorId)}`, { name });
+
 // ── Downward commands (actuate / bus_recovery / sensor_port_up|down) ─────────
 // The backend resolves the broker `tid` from tenants.mqtt_tid, builds the exact
 // wire envelope, logs it (cid), and publishes to usc/thesis/{tid}/{nid}/cmd if a

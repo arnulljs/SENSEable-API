@@ -374,6 +374,50 @@ export async function persistPortActive(port, attached) {
     c.query(`UPDATE ports SET active_flag=$2 WHERE port_id=$1`, [port._uuid, attached]));
 }
 
+// ── Renames (write-through, RLS-enforced) ───────────────────────────────────
+// Each writes to Postgres FIRST (through withTenant → RLS), then updates the
+// in-memory cache only on success, so a failed write never leaves the cache and
+// the DB disagreeing. The name is the single source of truth: the /devices
+// projection reads it straight from the cache, so every page that renders the
+// device/board/actuator picks up the new name on its next poll.
+function normName(name) {
+  const s = String(name ?? '').trim();
+  if (!s) throw new Error('name is required');
+  if (s.length > 120) throw new Error('name too long (max 120 chars)');
+  return s;
+}
+
+export async function renameDevice(dev, name) {
+  const label = normName(name);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query(`UPDATE devices SET name=$2 WHERE device_id=$1`, [dev._uuid, label]));
+  dev.name = label;
+  return dev;
+}
+
+export async function renameModule(dev, moduleId, name) {
+  const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
+  if (!mod) throw new Error(`unknown module '${moduleId}'`);
+  const label = normName(name);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query(`UPDATE modules SET name=$2 WHERE module_id=$1`, [mod._uuid, label]));
+  mod.name = label;
+  return mod;
+}
+
+export async function renameActuator(dev, actuatorId, name) {
+  const act = (dev.actuators ?? []).find((a) => a.id === actuatorId);
+  if (!act) throw new Error(`unknown actuator '${actuatorId}'`);
+  const label = normName(name);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query(
+      `UPDATE actuators SET name=$3 WHERE device_id=$1 AND actuator_code=$2`,
+      [dev._uuid, act.id, label]
+    ));
+  act.name = label;
+  return act;
+}
+
 // ── Actuators + commands + ack correlation ──────────────────────────────────
 const portNumOf = (p) => {
   const m = String(p).match(/(\d+)/);

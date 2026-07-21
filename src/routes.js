@@ -17,6 +17,7 @@ import {
   markNotificationRead, markAllNotificationsRead,
   createFormula, deleteFormula, assignChannel, saveMapSensors,
   findNode, recordCommand, applyActuatorCommand,
+  renameDevice, renameModule, renameActuator,
 } from './store.js';
 import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './ingest.js';
 import { fitLinear } from './calibration.js';
@@ -98,6 +99,58 @@ router.get('/map-sensors', (_req, res) => res.json(store.mapSensors));
 router.put('/map-sensors', wrap(async (req, res) => {
   if (!Array.isArray(req.body)) return res.status(400).json({ error: 'expected an array' });
   res.json(await saveMapSensors(req.body));
+}));
+
+// --- Renames (device / module / actuator) -----------------------------------
+// PATCH { name }. Persists to Postgres (RLS-enforced) and updates the cache, so
+// the new name shows everywhere the entity is referenced on the next poll.
+// The updated device projection is returned so the client can reconcile.
+function projectOne(dev) {
+  return projectDevices(dev.tenantId).find((d) => d.id === dev.id) ?? null;
+}
+
+function resolveDevice(req, res) {
+  const dev = findNode(req.params.deviceId);
+  if (!dev) {
+    res.status(404).json({ error: `unknown device '${req.params.deviceId}'` });
+    return null;
+  }
+  return dev;
+}
+
+router.patch('/devices/:deviceId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    await renameDevice(dev, req.body?.name);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+  res.json({ ok: true, device: projectOne(dev) });
+}));
+
+router.patch('/devices/:deviceId/modules/:moduleId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    await renameModule(dev, req.params.moduleId, req.body?.name);
+  } catch (e) {
+    const code = /unknown module/.test(e.message) ? 404 : 400;
+    return res.status(code).json({ error: e.message });
+  }
+  res.json({ ok: true, device: projectOne(dev) });
+}));
+
+router.patch('/devices/:deviceId/actuators/:actuatorId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    await renameActuator(dev, req.params.actuatorId, req.body?.name);
+  } catch (e) {
+    const code = /unknown actuator/.test(e.message) ? 404 : 400;
+    return res.status(code).json({ error: e.message });
+  }
+  res.json({ ok: true, device: projectOne(dev) });
 }));
 
 // --- Commands (downward) ----------------------------------------------------
