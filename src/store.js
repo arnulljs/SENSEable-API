@@ -30,15 +30,15 @@
 
 import { withTenant, adminPool } from '../db/pool.js';
 import { applyCalibration } from './calibration.js';
+import { fmtTs } from './read.js';
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
 
-function fmtTs(d) {
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric',
-    hour: 'numeric', minute: '2-digit', hour12: true,
-  });
-}
+// Display formatting lives in read.js so BOTH tiers format identically. Left
+// local, toLocaleString() uses the host timezone — UTC+8 on the on-site edge
+// server, UTC on a Vercel function — and the same reading would render eight
+// hours apart depending on which tier served it.
+
 
 export const deviceKey = (slug, nodeId) => `${slug}:${nodeId}`;
 
