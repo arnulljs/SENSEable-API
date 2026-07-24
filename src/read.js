@@ -26,6 +26,16 @@
 // it's redundant but harmless, and it keeps one code path for all three.
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
+const STALE_MS = Number(process.env.STALE_MS ?? 30_000);
+
+// Mirrors store.js: "active" = reported within the staleness window. The UI uses
+// it to decide whether a remove button is offered, so both tiers must agree.
+const freshly = (ts, now) => ts != null && now - new Date(ts).getTime() <= STALE_MS;
+
+// Board-status rollup — must match deriveModuleStatus() in status.js exactly, or
+// the same board would show a different colour depending on which tier answered.
+const RANK = { Offline: 3, Fault: 2, Warning: 1, Normal: 0 };
+const UI_TO_DEVICE = { Offline: 'offline', Fault: 'fault', Warning: 'warning', Normal: 'online' };
 
 // The frontend's device id is `${slug}:${nodeId}` — globally unique across
 // tenants, unlike the firmware's hardcoded node_id.
@@ -56,9 +66,13 @@ export async function readDevices(client, { tenantSlug = null } = {}) {
       d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
+      m.last_seen AS module_last_seen, m.configured AS module_configured,
       p.port_id, p.port_code, p.port_index, p.label, p.unit,
       p.range_min, p.range_max, p.safe_min, p.safe_max, p.active_flag,
-      p.last_value, p.last_status,
+      p.last_value, p.last_status, p.last_seen AS port_last_seen,
+      p.configured AS port_configured, p.enabled AS port_enabled,
+      p.disabled_reason,
+      d.configured AS device_configured,
       f.label AS formula_label
     FROM devices d
     JOIN tenants t ON t.tenant_id = d.tenant_id
@@ -84,9 +98,12 @@ export async function readDevices(client, { tenantSlug = null } = {}) {
         uptime: Number(r.uptime_s ?? 0),
         rssi: r.rssi,
         freeHeap: r.free_heap,
+        lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
+        configured: r.device_configured ?? true,
         modules: [],
         actuators: [],
         _uuid: r.device_id,
+        _lastSeenRaw: r.last_seen,
       });
     }
     const dev = byDevice.get(id);
@@ -97,7 +114,10 @@ export async function readDevices(client, { tenantSlug = null } = {}) {
     let mod = dev.modules.find((m) => m._uuid === r.module_id);
     if (!mod) {
       mod = { id: r.i2c_address, address: r.i2c_address, name: r.module_name,
-              ports: [], _uuid: r.module_id };
+              ports: [], _uuid: r.module_id,
+              lastSeen: r.module_last_seen ? new Date(r.module_last_seen).getTime() : null,
+              configured: r.module_configured ?? true,
+              _lastSeenRaw: r.module_last_seen };
       dev.modules.push(mod);
     }
     if (!r.port_id) continue;
@@ -119,7 +139,12 @@ export async function readDevices(client, { tenantSlug = null } = {}) {
       // last persisted discovery result rather than an in-flight packet.
       connState: r.active_flag ? 'CONNECTED' : 'DISCONNECTED',
       masked: false,
+      lastSeen: r.port_last_seen ? new Date(r.port_last_seen).getTime() : null,
+      configured: r.port_configured ?? true,
+      enabled: r.port_enabled ?? true,
+      disabledReason: r.disabled_reason ?? null,
       _uuid: r.port_id,
+      _lastSeenRaw: r.port_last_seen,
       _formulaLabel: r.formula_label ?? null,
     });
   }
@@ -128,22 +153,58 @@ export async function readDevices(client, { tenantSlug = null } = {}) {
   await attachActuators(client, byDevice, tenantSlug);
 
   // Strip internals so the payload matches projectDevices() exactly.
-  return [...byDevice.values()].map((d) => ({
-    id: d.id, tenantId: d.tenantId, name: d.name, nodeId: d.nodeId,
-    status: d.status, commMode: d.commMode,
-    uptime: d.uptime, rssi: d.rssi, freeHeap: d.freeHeap,
-    modules: d.modules.map((m) => ({
-      id: m.id, address: m.address, name: m.name,
-      ports: m.ports.map((p) => ({
+  const now = Date.now();
+  return [...byDevice.values()].map((d) => {
+    const modules = d.modules.map((m) => {
+      const ports = m.ports.map((p) => ({
         id: p.id, label: p.label, unit: p.unit,
         value: p.value, rangeMin: p.rangeMin, rangeMax: p.rangeMax,
         safeMin: p.safeMin, safeMax: p.safeMax,
-        status: p.status, history: p.history,
+        // last_status is the value persisted at the last successful reading, so
+        // it stays "Normal" forever once a sensor dies. The edge tier recomputes
+        // status live against STALE_MS; without the same check here, the cloud
+        // dashboard would cheerfully show a green gauge for a channel that
+        // stopped reporting days ago.
+        status: p.enabled === false
+          ? 'Disabled'
+          : (freshly(p._lastSeenRaw, now) ? p.status : 'Offline'),
+        history: p.history,
         activeFlag: p.activeFlag, connState: p.connState ?? null, masked: !!p.masked,
-      })),
-    })),
-    actuators: d.actuators ?? [],
-  }));
+        lastSeen: p.lastSeen ?? null,
+        active: freshly(p._lastSeenRaw, now),
+        configured: p.configured ?? true,
+        enabled: p.enabled !== false,
+        disabledReason: p.disabledReason ?? null,
+      }));
+      const modActive = freshly(m._lastSeenRaw, now) || ports.some((p) => p.active);
+      const considered = ports.map((p) => p.status).filter((x) => x !== 'Disabled');
+      let worst = 'Normal';
+      for (const st of considered) {
+        // Matches deriveModuleStatus(): a single dead sensor is a warning about
+        // the board, not proof the board itself is gone.
+        const asNode = st === 'Offline' ? 'Warning' : st;
+        if (RANK[asNode] > RANK[worst]) worst = asNode;
+      }
+      return {
+        id: m.id, address: m.address, name: m.name,
+        lastSeen: m.lastSeen ?? null,
+        active: modActive,
+        configured: m.configured ?? true,
+        status: (!modActive || !considered.length) ? 'offline' : (UI_TO_DEVICE[worst] ?? 'offline'),
+        ports,
+      };
+    });
+    return {
+      id: d.id, tenantId: d.tenantId, name: d.name, nodeId: d.nodeId,
+      status: d.status, commMode: d.commMode,
+      uptime: d.uptime, rssi: d.rssi, freeHeap: d.freeHeap,
+      lastSeen: d.lastSeen ?? null,
+      active: freshly(d._lastSeenRaw, now) || modules.some((m) => m.active),
+      configured: d.configured ?? true,
+      modules,
+      actuators: d.actuators ?? [],
+    };
+  });
 }
 
 // Most-recent HISTORY_CAP readings per port, oldest-first (chart order).

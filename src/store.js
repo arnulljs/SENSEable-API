@@ -31,6 +31,7 @@
 import { withTenant, adminPool } from '../db/pool.js';
 import { applyCalibration } from './calibration.js';
 import { fmtTs } from './read.js';
+import { STALE_MS, deriveModuleStatus } from './status.js';
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
 
@@ -81,10 +82,13 @@ export async function hydrate() {
       d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
+      m.last_seen AS module_last_seen, m.configured AS module_configured,
       p.port_id, p.port_code, p.port_index, p.label, p.unit,
       p.range_min, p.range_max, p.safe_min, p.safe_max,
       p.active_flag, p.cal_type, p.cal_slope, p.cal_offset,
-      p.last_value, p.last_status,
+      p.last_value, p.last_status, p.last_seen AS port_last_seen,
+      p.configured AS port_configured, p.enabled AS port_enabled,
+      p.disabled_reason,
       f.label AS formula_label, f.expression AS formula_expr
     FROM devices d
     JOIN tenants t ON t.tenant_id = d.tenant_id
@@ -124,6 +128,10 @@ export async function hydrate() {
       mod = {
         id: r.i2c_address, _uuid: r.module_id,
         address: r.i2c_address, name: r.module_name, ports: [],
+        // Presence survives restarts: a board last heard from days ago stays in
+        // the inventory reading Offline rather than vanishing.
+        lastSeen: r.module_last_seen ? new Date(r.module_last_seen).getTime() : null,
+        configured: r.module_configured ?? true,
       };
       dev.modules.push(mod);
     }
@@ -145,7 +153,12 @@ export async function hydrate() {
       status: r.last_status ?? 'Offline',
       connState: r.active_flag ? 'CONNECTED' : 'DISCONNECTED',
       masked: false,
-      lastSeen: null,          // no live telemetry yet this process
+      // Restored from the DB rather than reset to null, so "last seen" is real
+      // across restarts. Staleness still forces Offline until fresh telemetry.
+      lastSeen: r.port_last_seen ? new Date(r.port_last_seen).getTime() : null,
+      configured: r.port_configured ?? true,
+      enabled: r.port_enabled ?? true,
+      disabledReason: r.disabled_reason ?? null,
       history: [],             // filled by loadHistory() below
     });
   }
@@ -390,8 +403,10 @@ function normName(name) {
 export async function renameDevice(dev, name) {
   const label = normName(name);
   await withTenant(dev._tenantUuid, (c) =>
-    c.query(`UPDATE devices SET name=$2 WHERE device_id=$1`, [dev._uuid, label]));
+    c.query(`UPDATE devices SET name=$2, configured=true WHERE device_id=$1`,
+            [dev._uuid, label]));
   dev.name = label;
+  dev.configured = true;
   return dev;
 }
 
@@ -400,8 +415,10 @@ export async function renameModule(dev, moduleId, name) {
   if (!mod) throw new Error(`unknown module '${moduleId}'`);
   const label = normName(name);
   await withTenant(dev._tenantUuid, (c) =>
-    c.query(`UPDATE modules SET name=$2 WHERE module_id=$1`, [mod._uuid, label]));
+    c.query(`UPDATE modules SET name=$2, configured=true WHERE module_id=$1`,
+            [mod._uuid, label]));
   mod.name = label;
+  mod.configured = true;
   return mod;
 }
 
@@ -655,25 +672,130 @@ export function resolvePort(deviceId, moduleId, portId) {
 // ── Projection to the frontend shape ────────────────────────────────────────
 // Internal uuids (_uuid/_tenantUuid) are stripped — the API surface stays the
 // hardware-real, tenant-namespaced ids the React app consumes.
+// "Active" means currently reporting — seen within the staleness window. It is
+// the ONLY thing that gates deletion: you may remove hardware that has gone
+// quiet, never hardware that is live. Exposing it per entity lets the UI show or
+// hide each remove button without a second round-trip.
+export const isPortActive   = (p, now = Date.now()) => p.lastSeen != null && now - p.lastSeen <= STALE_MS;
+export const isModuleActive = (m, now = Date.now()) =>
+  (m.lastSeen != null && now - m.lastSeen <= STALE_MS) || m.ports.some((p) => isPortActive(p, now));
+export const isDeviceActive = (d, now = Date.now()) =>
+  (d.lastSeen != null && now - d.lastSeen <= STALE_MS) || d.modules.some((m) => isModuleActive(m, now));
+
 export function projectDevices(tenantId = null) {
+  const now = Date.now();
   return store.devices
     .filter((d) => (tenantId ? d.tenantId === tenantId : true))
     .map((d) => ({
       id: d.id, tenantId: d.tenantId, name: d.name, nodeId: d.nodeId,
       status: d.status, commMode: d.commMode,
       uptime: d.uptime, rssi: d.rssi, freeHeap: d.freeHeap,
-      modules: d.modules.map((m) => ({
-        id: m.id, address: m.address, name: m.name,
-        ports: m.ports.map((p) => ({
+      lastSeen: d.lastSeen ?? null,
+      active: isDeviceActive(d, now),
+      configured: d.configured ?? true,
+      modules: d.modules.map((m) => {
+        const ports = m.ports.map((p) => ({
           id: p.id, label: p.label, unit: p.unit,
           value: p.value, rangeMin: p.rangeMin, rangeMax: p.rangeMax,
           safeMin: p.safeMin, safeMax: p.safeMax,
-          status: p.status, history: p.history,
+          // A switched-off channel reports 'Disabled' rather than a colour that
+          // implies a judgement about a reading nobody is monitoring.
+          status: p.enabled === false ? 'Disabled' : p.status,
+          history: p.history,
           activeFlag: p.activeFlag, connState: p.connState ?? null, masked: !!p.masked,
-        })),
-      })),
+          lastSeen: p.lastSeen ?? null,
+          active: isPortActive(p, now),
+          configured: p.configured ?? true,
+          enabled: p.enabled !== false,
+          disabledReason: p.disabledReason ?? null,
+        }));
+        return {
+          id: m.id, address: m.address, name: m.name,
+          lastSeen: m.lastSeen ?? null,
+          active: isModuleActive(m, now),
+          configured: m.configured ?? true,
+          status: deriveModuleStatus({
+            portStatuses: ports.map((p) => p.status),
+            lastSeen: m.lastSeen, now,
+          }),
+          ports,
+        };
+      }),
       actuators: d.actuators ?? [],
     }));
+}
+
+// ── Removal (operator-initiated, never automatic) ───────────────────────────
+// Absence alone must never delete anything — a node that drops off for ten
+// minutes would otherwise lose its calibration. So removal is explicit, and
+// refused outright while the hardware is still reporting.
+class ActiveHardwareError extends Error {
+  constructor(what) {
+    super(`${what} is currently reporting and cannot be removed — disconnect it first`);
+    this.status = 409;
+  }
+}
+
+// ── Enabling / disabling a channel ──────────────────────────────────────────
+// An unconnected ADS1115 input floats: leakage current and channel-to-channel
+// crosstalk push it to a few thousand counts, which the pipeline faithfully
+// renders as a healthy-looking gauge. Only a human knows nothing is wired there,
+// so this records that judgement. A disabled channel stops contributing to
+// status, stops raising notifications, and stops writing readings.
+export async function setPortEnabled(dev, moduleId, portId, enabled, reason = null) {
+  const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
+  if (!mod) { const e = new Error(`unknown module '${moduleId}'`); e.status = 404; throw e; }
+  const port = mod.ports.find((p) => p.id === portId || p._uuid === portId);
+  if (!port) { const e = new Error(`unknown port '${portId}'`); e.status = 404; throw e; }
+
+  const on = !!enabled;
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query(
+      `UPDATE ports SET enabled = $2,
+              disabled_reason = CASE WHEN $2 THEN NULL ELSE $3 END,
+              disabled_at     = CASE WHEN $2 THEN NULL ELSE now() END
+       WHERE port_id = $1`,
+      [port._uuid, on, reason]));
+
+  port.enabled = on;
+  port.disabledReason = on ? null : reason;
+  if (!on) {
+    // Freeze the last reading rather than clearing it — an operator may want to
+    // see what the channel was showing when they switched it off.
+    port.status = 'Disabled';
+  }
+  return port;
+}
+
+export async function removeDevice(dev) {
+  if (isDeviceActive(dev)) throw new ActiveHardwareError(`device '${dev.name}'`);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query('DELETE FROM devices WHERE device_id = $1', [dev._uuid]));
+  const i = store.devices.indexOf(dev);
+  if (i >= 0) store.devices.splice(i, 1);
+  return { removed: dev.id };
+}
+
+export async function removeModule(dev, moduleId) {
+  const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
+  if (!mod) { const e = new Error(`unknown module '${moduleId}'`); e.status = 404; throw e; }
+  if (isModuleActive(mod)) throw new ActiveHardwareError(`board '${mod.name}'`);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query('DELETE FROM modules WHERE module_id = $1', [mod._uuid]));
+  dev.modules.splice(dev.modules.indexOf(mod), 1);
+  return { removed: `${dev.id}::${mod.id}` };
+}
+
+export async function removePort(dev, moduleId, portId) {
+  const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
+  if (!mod) { const e = new Error(`unknown module '${moduleId}'`); e.status = 404; throw e; }
+  const port = mod.ports.find((p) => p.id === portId || p._uuid === portId);
+  if (!port) { const e = new Error(`unknown port '${portId}'`); e.status = 404; throw e; }
+  if (isPortActive(port)) throw new ActiveHardwareError(`channel '${port.id}'`);
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query('DELETE FROM ports WHERE port_id = $1', [port._uuid]));
+  mod.ports.splice(mod.ports.indexOf(port), 1);
+  return { removed: `${dev.id}::${mod.id}::${port.id}` };
 }
 
 export { applyCalibration };

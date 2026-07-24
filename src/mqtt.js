@@ -28,7 +28,10 @@ export function publishCommand(topic, payloadObj, { qos = 1 } = {}) {
   return true;
 }
 
-function route(topic, buf) {
+// Ingest is async now (it may provision new hardware on first sight), so this
+// awaits rather than fire-and-forgetting — otherwise a burst of packets from an
+// unknown node could each try to create it before the first insert lands.
+async function route(topic, buf) {
   let pkt;
   try { pkt = JSON.parse(buf.toString()); }
   catch { console.warn('[mqtt] non-JSON payload on', topic); return; }
@@ -36,12 +39,18 @@ function route(topic, buf) {
   // Prefer the packet's own type; fall back to the topic suffix.
   const kind = pkt.t ?? topic.split('/').pop();
   let result;
-  if (kind === 'tlm')        result = ingestTelemetry(pkt);
-  else if (kind === 'disco') result = ingestDiscovery(pkt);
-  else if (kind === 'ack')   result = ingestAck(pkt);
-  else return; // ignore our own outbound cmd echoes and anything unknown
+  try {
+    if (kind === 'tlm')        result = await ingestTelemetry(pkt);
+    else if (kind === 'disco') result = await ingestDiscovery(pkt);
+    else if (kind === 'ack')   result = await ingestAck(pkt);
+    else return; // ignore our own outbound cmd echoes and anything unknown
+  } catch (e) {
+    console.error(`[mqtt] ${topic}: ingest threw —`, e.message);
+    return;
+  }
 
   if (result && !result.ok) console.warn(`[mqtt] ${topic}: ${result.error}`);
+  if (result?.provisioned) console.log(`[mqtt] ${topic}: provisioned ${result.provisioned} new item(s)`);
 }
 
 export function startMqtt() {

@@ -18,10 +18,11 @@ import {
   createFormula, deleteFormula, assignChannel, saveMapSensors,
   findNode, recordCommand, applyActuatorCommand,
   renameDevice, renameModule, renameActuator,
+  removeDevice, removeModule, removePort, setPortEnabled,
 } from './store.js';
 import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './ingest.js';
 import { fitLinear } from './calibration.js';
-import { buildCommand, cmdTopic } from './commands.js';
+import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand } from './mqtt.js';
 
 export const router = Router();
@@ -153,6 +154,104 @@ router.patch('/devices/:deviceId/actuators/:actuatorId', wrap(async (req, res) =
   res.json({ ok: true, device: projectOne(dev) });
 }));
 
+// --- Channel enable / disable ------------------------------------------------
+// PATCH { enabled: bool, reason?: string }
+//
+// Silences an ADC channel with nothing wired to it. A floating ADS1115 input
+// reads leakage voltage — typically a few thousand counts — which the pipeline
+// would otherwise render as a healthy gauge for a socket with no sensor in it.
+//
+// This does TWO things, because either alone is insufficient:
+//
+//   1. Sends sensor_port_down/up to the node, so the firmware stops sampling the
+//      channel at source. This is the real fix — the garbage never enters the
+//      pipeline. It is best-effort: the current firmware may not implement the
+//      command branch yet, and no broker may be attached.
+//
+//   2. Sets ports.enabled, which takes effect immediately and unconditionally.
+//      The dashboard is correct from the next poll whether or not (1) landed.
+router.patch('/devices/:deviceId/modules/:moduleId/ports/:portId/enabled',
+  wrap(async (req, res) => {
+    const dev = resolveDevice(req, res);
+    if (!dev) return;
+
+    const enabled = req.body?.enabled;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ error: 'body must be { enabled: true | false }' });
+    }
+
+    let port;
+    try {
+      port = await setPortEnabled(dev, req.params.moduleId, req.params.portId,
+                                  enabled, req.body?.reason ?? null);
+    } catch (e) {
+      return res.status(e.status ?? 400).json({ error: e.message });
+    }
+
+    // Best-effort firmware command. Chip index is the position of the board's
+    // I2C address in the fixed 0x48..0x4B range the protocol defines.
+    let command = null;
+    try {
+      const tenant = store.tenants[dev.tenantId];
+      const mqttTid = tenant?.mqttTid;
+      const chip = CHIP_ADDRS.indexOf(String(req.params.moduleId).toLowerCase());
+      if (mqttTid && chip >= 0 && Number.isInteger(port.channel)) {
+        const envelope = buildCommand(
+          enabled ? 'sensor_port_up' : 'sensor_port_down',
+          { tid: mqttTid, nid: dev.nodeId },
+          { chip, ch: port.channel });
+        const rec = await recordCommand(dev, envelope);
+        const published = publishCommand(cmdTopic(mqttTid, dev.nodeId), envelope);
+        command = { cid: envelope.cid, published, action: envelope.action, id: rec?.id ?? null };
+      }
+    } catch (e) {
+      // A firmware that can't be told is not a failure: the server-side flag
+      // already made the dashboard correct.
+      console.warn('[routes] sensor_port toggle not sent:', e.message);
+    }
+
+    res.json({ ok: true, enabled: port.enabled, command, device: projectOne(dev) });
+  }));
+
+// --- Removal (operator-initiated) -------------------------------------------
+// Hardware that goes quiet is KEPT and marked Offline — never auto-deleted —
+// so a dropped connection can't destroy an operator's calibration work. These
+// endpoints are the only way inventory is removed, and they refuse (409) while
+// the target is still reporting. Deletes cascade: removing a board removes its
+// channels, removing a node removes everything under it.
+router.delete('/devices/:deviceId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    const r = await removeDevice(dev);
+    res.json({ ok: true, ...r });
+  } catch (e) {
+    res.status(e.status ?? 400).json({ error: e.message });
+  }
+}));
+
+router.delete('/devices/:deviceId/modules/:moduleId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    const r = await removeModule(dev, req.params.moduleId);
+    res.json({ ok: true, ...r, device: projectOne(dev) });
+  } catch (e) {
+    res.status(e.status ?? 400).json({ error: e.message });
+  }
+}));
+
+router.delete('/devices/:deviceId/modules/:moduleId/ports/:portId', wrap(async (req, res) => {
+  const dev = resolveDevice(req, res);
+  if (!dev) return;
+  try {
+    const r = await removePort(dev, req.params.moduleId, req.params.portId);
+    res.json({ ok: true, ...r, device: projectOne(dev) });
+  } catch (e) {
+    res.status(e.status ?? 400).json({ error: e.message });
+  }
+}));
+
 // --- Commands (downward) ----------------------------------------------------
 // Body: { deviceId, action, ...branchParams }
 //   actuate            { port|actuatorId, mode:'bin'|'pwm', state?, duty?, dur? }
@@ -229,20 +328,20 @@ router.get('/commands', (req, res) => {
 });
 
 // --- Ingest (broker-free) ---------------------------------------------------
-router.post('/ingest/telemetry', (req, res) => {
-  const result = ingestTelemetry(req.body);
+router.post('/ingest/telemetry', wrap(async (req, res) => {
+  const result = await ingestTelemetry(req.body);
   res.status(result.ok ? 200 : 400).json(result);
-});
+}));
 
-router.post('/ingest/discovery', (req, res) => {
-  const result = ingestDiscovery(req.body);
+router.post('/ingest/discovery', wrap(async (req, res) => {
+  const result = await ingestDiscovery(req.body);
   res.status(result.ok ? 200 : 400).json(result);
-});
+}));
 
-router.post('/ingest/ack', (req, res) => {
-  const result = ingestAck(req.body);
+router.post('/ingest/ack', wrap(async (req, res) => {
+  const result = await ingestAck(req.body);
   res.status(result.ok ? 200 : 400).json(result);
-});
+}));
 
 // --- Ops --------------------------------------------------------------------
 router.get('/health', (_req, res) => {
