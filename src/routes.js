@@ -23,7 +23,7 @@ import {
 import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './ingest.js';
 import { fitLinear } from './calibration.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
-import { publishCommand } from './mqtt.js';
+import { publishCommand, getMqttStats } from './mqtt.js';
 
 export const router = Router();
 
@@ -345,12 +345,25 @@ router.post('/ingest/ack', wrap(async (req, res) => {
 
 // --- Ops --------------------------------------------------------------------
 router.get('/health', (_req, res) => {
+  // MQTT state is included because "the dashboard is frozen" has two very
+  // different causes — the broker link is down, or the node stopped publishing —
+  // and they are indistinguishable from the UI. `mqtt.lastPacketAgeMs` settles
+  // it immediately, and `mqtt.refused` names any topic the broker's ACL denied.
+  const mqtt = getMqttStats();
+  const freshest = store.devices.reduce(
+    (acc, d) => (d.lastSeen && d.lastSeen > acc ? d.lastSeen : acc), 0);
+
   res.json({
     ok: true,
     store: store.ready ? 'postgres' : 'hydrating',
     nodes: store.devices.length,
     tenants: Object.keys(store.tenants).length,
     commands: store.commands.length,
+    // Which tids ingest will accept. If the node's tid isn't here, every packet
+    // is rejected and the dashboard freezes with no other clue.
+    acceptedTids: Object.keys(store.tenantByMqttTid),
+    newestTelemetryAgeMs: freshest ? Date.now() - freshest : null,
+    mqtt,
     now: new Date().toISOString(),
   });
 });
