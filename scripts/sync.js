@@ -317,8 +317,24 @@ async function main() {
   if (ONCE || DRY) return;
 
   log(`replicating every ${INTERVAL_MS}ms — Ctrl+C to stop`);
+  // A pass that outruns the interval must NOT start a second one. Each pass
+  // opens connections per table; overlapping passes multiply that against a
+  // pooler capped at 15 backend connections, and the first pass to finish
+  // tears down pools the others are still using. The observed failure is a
+  // cascade of "connection timeout" then "cannot use a pool after end" that
+  // wedges the pooler for ~15 minutes — and restarting the worker only feeds
+  // it. Skipping a tick is always cheaper: the watermark means the next pass
+  // picks up exactly where this one left off.
+  let inFlight = false;
   const timer = setInterval(() => {
-    runOnce().catch((e) => log('pass error:', e.message));
+    if (inFlight) {
+      log(`previous pass still running after ${INTERVAL_MS}ms — skipping this tick`);
+      return;
+    }
+    inFlight = true;
+    runOnce()
+      .catch((e) => log('pass error:', e.message))
+      .finally(() => { inFlight = false; });
   }, INTERVAL_MS);
 
   const shutdown = async () => {
