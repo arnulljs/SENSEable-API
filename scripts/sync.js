@@ -26,7 +26,7 @@ import 'dotenv/config';
 import dotenv from 'dotenv';
 import pg from 'pg';
 
-dotenv.config({ path: '.env.cloud' });   // cloud URLs live in a separate file
+dotenv.config({ path: '.env.cloud', override: true });   // cloud URLs live in a separate file — override: true so a stray var of the same name in .env can't silently win
 
 const { Pool } = pg;
 const args = new Set(process.argv.slice(2));
@@ -67,8 +67,19 @@ const localPool = new Pool({
   connectionString: process.env.DATABASE_URL_OWNER ?? process.env.DATABASE_URL,
   max: 4,
 });
+// SSL is forced here rather than via ?sslmode= in the URL. pg-connection-string
+// treats 'require'/'prefer'/'verify-ca' as aliases for 'verify-full' (see the
+// SECURITY WARNING pg prints on connect), so any URL-based sslmode short of a
+// literal disable still attempts full chain verification. That verification
+// path hung indefinitely (AggregateError [ETIMEDOUT], empty message) on this
+// network even though psql, using its own TLS stack, connected to the same
+// host/port instantly. Setting ssl explicitly on the Pool bypasses
+// pg-connection-string's URL parsing entirely — this is the same pattern
+// api/_db.js already uses successfully for the Vercel read tier, which has
+// no reliable way to reference a checked-in CA file either.
 const cloudPool = new Pool({
   connectionString: process.env.CLOUD_DATABASE_URL_OWNER,
+  ssl: { rejectUnauthorized: false },
   max: 4,
   // Cloud is across the WAN; fail fast rather than hanging a whole pass.
   connectionTimeoutMillis: 15_000,
