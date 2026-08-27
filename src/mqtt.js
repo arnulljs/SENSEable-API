@@ -39,6 +39,7 @@
 // /api/health plus a periodic heartbeat.
 
 import { ingestTelemetry, ingestDiscovery, ingestAck } from './ingest.js';
+import { broadcastDevices } from './realtime.js';
 import { TOPIC_BASE } from './commands.js';
 
 let client = null;
@@ -112,6 +113,13 @@ async function route(topic, buf) {
     return;
   }
   stats.accepted += 1;
+
+  // The packet changed the read model, so tell every subscribed dashboard now
+  // rather than waiting for it to ask. Coalesced inside broadcastDevices(): a
+  // 16-channel burst collapses to a single frame, and this is a no-op when the
+  // socket server isn't running.
+  broadcastDevices();
+
   if (result?.provisioned) {
     console.log(`[mqtt] ${topic}: provisioned ${result.provisioned} new item(s)`);
   }

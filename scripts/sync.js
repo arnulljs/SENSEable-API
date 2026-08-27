@@ -283,6 +283,32 @@ async function runOnce() {
   log(failures.length
     ? `pass complete in ${secs}s — ${moved} row(s), ${failures.length} table(s) failed`
     : `pass complete in ${secs}s — ${moved} row(s) replicated`);
+
+  // Tell the cloud read tier that Supabase moved.
+  //
+  // The edge server can push to its own dashboards the instant a packet lands,
+  // because it IS the ingest point. The Vercel tier has no such signal — it only
+  // reads a replica, and nothing in that replica announces itself. Without this
+  // the cloud dashboard has no choice but to poll.
+  //
+  // NOTIFY is issued on the CLOUD connection (not the local one) because the
+  // listener lives in a Vercel function attached to Supabase. Payload is capped
+  // at 8000 bytes by Postgres, so this carries a summary only — the listener
+  // re-reads through the normal tenant-scoped read model rather than trusting
+  // anything in the message.
+  if (moved > 0 && !DRY) {
+    try {
+      await cloudPool.query('SELECT pg_notify($1, $2)', [
+        'senseable_sync',
+        JSON.stringify({ moved, at: Date.now() }),
+      ]);
+    } catch (err) {
+      // A failed notification must never fail the pass — replication already
+      // succeeded, and the cloud dashboard degrades to polling on its own.
+      log(`  notify failed (replication still OK) — ${err.message}`);
+    }
+  }
+
   return { moved, failures };
 }
 

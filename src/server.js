@@ -9,6 +9,7 @@ import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
 import { refreshAll } from './ingest.js';
 import { hydrate } from './store.js';
+import { startRealtime, stopRealtime, broadcastDevices } from './realtime.js';
 import { closePool } from '../db/pool.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
@@ -35,8 +36,11 @@ async function main() {
   }
 
   // Keep statuses honest even when nothing is ingesting: a node with no recent
-  // telemetry flips to Offline on its own.
-  setInterval(() => refreshAll(), SWEEP_MS).unref();
+  // telemetry flips to Offline on its own. This transition has NO packet behind
+  // it — it happens precisely because packets stopped — so the sweep has to push
+  // it explicitly or a disconnected node would keep reading green on every open
+  // dashboard until something else happened to trigger a broadcast.
+  setInterval(() => { refreshAll(); broadcastDevices(); }, SWEEP_MS).unref();
 
   const server = app.listen(PORT, () => {
     console.log(`[http] SENSEable backend on http://localhost:${PORT}`);
@@ -44,8 +48,14 @@ async function main() {
     startMqtt();
   });
 
+  // Share the HTTP server so the socket lives at ws://<same-host>/ws — no
+  // second port to open, and it inherits whatever the deployment already does
+  // for TLS termination.
+  startRealtime(server);
+
   const shutdown = async (sig) => {
     console.log(`\n[${sig}] shutting down...`);
+    await stopRealtime();
     server.close();
     await closePool();
     process.exit(0);

@@ -11,13 +11,14 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "simulate": "node scripts/simulate.js",
-    "check": "node --check src/server.js && node --check src/store.js && node --check src/provision.js && node --check src/calibration.js && node --check src/ingest.js && node --check src/status.js && node --check src/routes.js && node --check src/mqtt.js && node --check src/commands.js && node --check scripts/sync.js",
+    "check": "node --check src/server.js && node --check src/store.js && node --check src/provision.js && node --check src/calibration.js && node --check src/ingest.js && node --check src/status.js && node --check src/routes.js && node --check src/mqtt.js && node --check src/commands.js && node --check scripts/sync.js && node --check src/realtime.js",
     "sync": "node scripts/sync.js",
     "sync:once": "node scripts/sync.js --once",
     "sync:status": "node scripts/sync.js --status",
     "sync:backfill": "node scripts/sync.js --backfill",
     "migrate:cloud": "node-pg-migrate -m db/migrations --envPath .env.cloud --database-url-var CLOUD_DATABASE_URL_OWNER",
-    "migrate": "node-pg-migrate -m db/migrations --envPath .env --database-url-var DATABASE_URL_OWNER"
+    "migrate": "node-pg-migrate -m db/migrations --envPath .env --database-url-var DATABASE_URL_OWNER",
+    "test:realtime": "node scripts/test-realtime.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -25,6 +26,10 @@
     "express": "^4.21.2",
     "mathjs": "^15.2.0",
     "mqtt": "^5.10.3",
-    "pg": "^8.22.0"
+    "pg": "^8.22.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "node-pg-migrate": "^9.0.0"
   }
 }

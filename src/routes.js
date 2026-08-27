@@ -24,6 +24,7 @@ import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './inges
 import { fitLinear } from './calibration.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand, getMqttStats } from './mqtt.js';
+import { broadcastDevices, getRealtimeStats } from './realtime.js';
 
 export const router = Router();
 
@@ -106,7 +107,13 @@ router.put('/map-sensors', wrap(async (req, res) => {
 // PATCH { name }. Persists to Postgres (RLS-enforced) and updates the cache, so
 // the new name shows everywhere the entity is referenced on the next poll.
 // The updated device projection is returned so the client can reconcile.
+// Every mutating route that returns an updated device funnels through here, so
+// this is also the one place that needs to tell OTHER open dashboards the read
+// model moved. Without it a rename or a channel disable would reach the editor
+// immediately (it's in the response) but not the operator watching the same
+// tenant on another screen until their next reload.
 function projectOne(dev) {
+  broadcastDevices();
   return projectDevices(dev.tenantId).find((d) => d.id === dev.id) ?? null;
 }
 
@@ -328,18 +335,23 @@ router.get('/commands', (req, res) => {
 });
 
 // --- Ingest (broker-free) ---------------------------------------------------
+// These mirror the broker path for bench work and tests, so they push on
+// success for the same reason route() in mqtt.js does.
 router.post('/ingest/telemetry', wrap(async (req, res) => {
   const result = await ingestTelemetry(req.body);
+  if (result.ok) broadcastDevices();
   res.status(result.ok ? 200 : 400).json(result);
 }));
 
 router.post('/ingest/discovery', wrap(async (req, res) => {
   const result = await ingestDiscovery(req.body);
+  if (result.ok) broadcastDevices();
   res.status(result.ok ? 200 : 400).json(result);
 }));
 
 router.post('/ingest/ack', wrap(async (req, res) => {
   const result = await ingestAck(req.body);
+  if (result.ok) broadcastDevices();
   res.status(result.ok ? 200 : 400).json(result);
 }));
 
@@ -350,6 +362,7 @@ router.get('/health', (_req, res) => {
   // and they are indistinguishable from the UI. `mqtt.lastPacketAgeMs` settles
   // it immediately, and `mqtt.refused` names any topic the broker's ACL denied.
   const mqtt = getMqttStats();
+  const ws = getRealtimeStats();
   const freshest = store.devices.reduce(
     (acc, d) => (d.lastSeen && d.lastSeen > acc ? d.lastSeen : acc), 0);
 
@@ -364,6 +377,9 @@ router.get('/health', (_req, res) => {
     acceptedTids: Object.keys(store.tenantByMqttTid),
     newestTelemetryAgeMs: freshest ? Date.now() - freshest : null,
     mqtt,
+    // Socket subscriber count and broadcast counters: "the dashboard isn't
+    // updating" is answerable from here without opening DevTools.
+    ws,
     now: new Date().toISOString(),
   });
 });
