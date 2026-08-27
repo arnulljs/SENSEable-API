@@ -5,6 +5,7 @@
 
 import express from 'express';
 import cors from 'cors';
+import { securityHeaders, corsOptions, apiKeyGate, readLimiter, logSecurityEvent } from './security.js';
 import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
 import { refreshAll } from './ingest.js';
@@ -15,10 +16,46 @@ import { closePool } from '../db/pool.js';
 const PORT = Number(process.env.PORT ?? 4000);
 
 const app = express();
-app.use(cors());                       // dev: allow the Vite origin
+
+// Trust the proxy hop count in front of us so req.ip is the real client rather
+// than the proxy — rate limiting keyed on the proxy's address would lump every
+// caller into one bucket.
+app.set('trust proxy', Number(process.env.TRUST_PROXY ?? 0));
+
+// Don't advertise the framework.
+app.disable('x-powered-by');
+
+app.use(securityHeaders);
+
+// Allowlisted origins instead of the wide-open cors(). See security.js: a
+// bare cors() lets ANY website read this API using the visitor's network
+// position, which on a LAN-deployed device is a real exposure.
+app.use(cors(corsOptions()));
+
+// Body cap. Already present, kept explicit: telemetry envelopes are small, and
+// an unbounded parser is a trivial memory exhaustion vector.
 app.use(express.json({ limit: '256kb' }));
 
+// Coarse gate. No-op unless API_KEY is set, so bench work is unaffected.
+app.use('/api', apiKeyGate);
+
+// Baseline limiter across the whole API; tighter limits are applied per-route
+// for writes and commands.
+app.use('/api', readLimiter);
+
 app.use('/api', router);
+
+// CORS rejections arrive here as a thrown Error. Without this they surface as
+// an unhandled stack trace on every blocked request — which buries the one line
+// that matters ("origin X not allowed") and, during a demo, looks like a crash
+// rather than a control doing its job.
+app.use((err, req, res, next) => {
+  if (err && /not allowed/.test(err.message)) {
+    logSecurityEvent('cors_blocked', req, err.message);
+    return res.status(403).json({ error: 'origin not allowed' });
+  }
+  return next(err);
+});
 app.get('/', (_req, res) =>
   res.json({ service: 'senseable-backend', ok: true, api: '/api' })
 );

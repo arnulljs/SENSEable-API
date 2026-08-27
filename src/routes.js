@@ -25,6 +25,7 @@ import { fitLinear } from './calibration.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand, getMqttStats } from './mqtt.js';
 import { broadcastDevices, getRealtimeStats } from './realtime.js';
+import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } from './security.js';
 
 export const router = Router();
 
@@ -41,6 +42,19 @@ const wrap = (fn) => (req, res) =>
 router.use((req, res, next) => {
   if (!store.ready) return res.status(503).json({ error: 'store hydrating, retry shortly' });
   next();
+});
+
+// Writes get a tighter budget than reads: no operator renames a board sixty
+// times a minute, and this is the surface where a runaway loop does real damage.
+router.use((req, res, next) => {
+  if (req.method === 'GET' || req.method === 'OPTIONS') return next();
+  return writeLimiter(req, res, next);
+});
+
+// Downlink commands are tighter still — each one actuates physical hardware.
+router.use('/commands', (req, res, next) => {
+  if (req.method !== 'POST') return next();
+  return commandLimiter(req, res, next);
 });
 
 // --- Read models the frontend renders --------------------------------------
@@ -71,7 +85,17 @@ router.post('/formulas', wrap(async (req, res) => {
   if (!label || !formula) {
     return res.status(400).json({ error: 'label and formula required' });
   }
-  const slug = tenant || tenantOf(req) || Object.keys(store.tenants)[0];
+  // FAIL CLOSED. This previously fell back to Object.keys(store.tenants)[0],
+  // so a request naming no tenant wrote a calibration formula into whichever
+  // tenant happened to be first in the map — a cross-tenant write with no
+  // attacker required. A formula is not a harmless row: it is the expression
+  // the ingest pipeline evaluates against raw ADC counts, so a stray one
+  // corrupts another tenant's engineering values.
+  const slug = tenant || tenantOf(req);
+  if (!slug) {
+    logSecurityEvent('missing_tenant', req, 'POST /formulas');
+    return res.status(400).json({ error: 'tenant is required — pass x-tenant-id or ?tenant=' });
+  }
   const entry = await createFormula(slug, label, formula);
   res.status(201).json(entry);
 }));
@@ -363,6 +387,7 @@ router.get('/health', (_req, res) => {
   // it immediately, and `mqtt.refused` names any topic the broker's ACL denied.
   const mqtt = getMqttStats();
   const ws = getRealtimeStats();
+  const security = getSecurityEvents();
   const freshest = store.devices.reduce(
     (acc, d) => (d.lastSeen && d.lastSeen > acc ? d.lastSeen : acc), 0);
 
@@ -380,6 +405,9 @@ router.get('/health', (_req, res) => {
     // Socket subscriber count and broadcast counters: "the dashboard isn't
     // updating" is answerable from here without opening DevTools.
     ws,
+    // Count only — the events themselves can name tenants and source
+    // addresses, so they stay in the server log rather than an open endpoint.
+    securityEvents: security.count,
     now: new Date().toISOString(),
   });
 });
