@@ -40,6 +40,7 @@
 
 import { ingestTelemetry, ingestDiscovery, ingestAck } from './ingest.js';
 import { broadcastDevices } from './realtime.js';
+import { checkAllPresence } from './presence.js';
 import { TOPIC_BASE } from './commands.js';
 
 let client = null;
@@ -113,6 +114,13 @@ async function route(topic, buf) {
     return;
   }
   stats.accepted += 1;
+
+  // Check presence on the ingest path too, not only on the sweep. Recovery is
+  // the case that matters: a node coming back is known the instant its first
+  // packet lands, and waiting up to SWEEP_MS to say so makes the system look
+  // slower to recover than it is. Going offline still comes from the sweep,
+  // since absence has no packet to trigger on.
+  checkAllPresence();
 
   // The packet changed the read model, so tell every subscribed dashboard now
   // rather than waiting for it to ask. Coalesced inside broadcastDevices(): a

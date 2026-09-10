@@ -26,6 +26,7 @@ import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand, getMqttStats } from './mqtt.js';
 import { broadcastDevices, getRealtimeStats } from './realtime.js';
 import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } from './security.js';
+import { getPresenceStats } from './presence.js';
 
 export const router = Router();
 
@@ -388,6 +389,7 @@ router.get('/health', (_req, res) => {
   const mqtt = getMqttStats();
   const ws = getRealtimeStats();
   const security = getSecurityEvents();
+  const presence = getPresenceStats();
   const freshest = store.devices.reduce(
     (acc, d) => (d.lastSeen && d.lastSeen > acc ? d.lastSeen : acc), 0);
 
@@ -408,6 +410,7 @@ router.get('/health', (_req, res) => {
     // Count only — the events themselves can name tenants and source
     // addresses, so they stay in the server log rather than an open endpoint.
     securityEvents: security.count,
+    presence,
     now: new Date().toISOString(),
   });
 });

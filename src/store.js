@@ -168,7 +168,12 @@ export async function hydrate() {
   const { rows: acts } = await adminPool.query(`
     SELECT a.*, d.node_id, t.slug FROM actuators a
     JOIN devices d ON d.device_id = a.device_id
-    JOIN tenants t ON t.tenant_id = a.tenant_id`);
+    JOIN tenants t ON t.tenant_id = a.tenant_id
+    -- ORDER BY is not cosmetic here. Without it Postgres returns heap order,
+    -- and an UPDATE rewrites the row to the end of the heap — so commanding
+    -- OUT1 made it jump to the bottom of the Control page on the next hydrate.
+    -- read.js already orders by port; this query was the one that didn't.
+    ORDER BY a.port`);
   for (const a of acts) {
     const dev = byDevice.get(deviceKey(a.slug, a.node_id));
     if (!dev) continue;

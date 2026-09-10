@@ -5,12 +5,13 @@
 
 import express from 'express';
 import cors from 'cors';
-import { securityHeaders, corsOptions, apiKeyGate, readLimiter, logSecurityEvent } from './security.js';
+import { securityHeaders, corsOptions, apiKeyGate, readLimiter } from './security.js';
 import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
 import { refreshAll } from './ingest.js';
 import { hydrate } from './store.js';
 import { startRealtime, stopRealtime, broadcastDevices } from './realtime.js';
+import { checkAllPresence } from './presence.js';
 import { closePool } from '../db/pool.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
@@ -44,18 +45,6 @@ app.use('/api', apiKeyGate);
 app.use('/api', readLimiter);
 
 app.use('/api', router);
-
-// CORS rejections arrive here as a thrown Error. Without this they surface as
-// an unhandled stack trace on every blocked request — which buries the one line
-// that matters ("origin X not allowed") and, during a demo, looks like a crash
-// rather than a control doing its job.
-app.use((err, req, res, next) => {
-  if (err && /not allowed/.test(err.message)) {
-    logSecurityEvent('cors_blocked', req, err.message);
-    return res.status(403).json({ error: 'origin not allowed' });
-  }
-  return next(err);
-});
 app.get('/', (_req, res) =>
   res.json({ service: 'senseable-backend', ok: true, api: '/api' })
 );
@@ -77,7 +66,15 @@ async function main() {
   // it — it happens precisely because packets stopped — so the sweep has to push
   // it explicitly or a disconnected node would keep reading green on every open
   // dashboard until something else happened to trigger a broadcast.
-  setInterval(() => { refreshAll(); broadcastDevices(); }, SWEEP_MS).unref();
+  setInterval(() => {
+    refreshAll();
+    // AFTER refreshAll, so presence compares settled statuses rather than
+    // racing the computation that produces them. This is where "the ESP32 went
+    // offline" is detected: that transition has no packet behind it — it
+    // happens precisely because packets stopped — so nothing else can notice it.
+    checkAllPresence();
+    broadcastDevices();
+  }, SWEEP_MS).unref();
 
   const server = app.listen(PORT, () => {
     console.log(`[http] SENSEable backend on http://localhost:${PORT}`);
