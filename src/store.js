@@ -32,6 +32,7 @@ import { withTenant, adminPool } from '../db/pool.js';
 import { applyCalibration } from './calibration.js';
 import { fmtTs } from './read.js';
 import { STALE_MS, deriveModuleStatus } from './status.js';
+import { staleMsFor } from './reconcile.js';
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
 
@@ -79,7 +80,7 @@ export async function hydrate() {
   const { rows } = await adminPool.query(`
     SELECT
       d.device_id, d.node_id, d.name AS device_name, d.status AS device_status,
-      d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen,
+      d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
       m.last_seen AS module_last_seen, m.configured AS module_configured,
@@ -114,6 +115,10 @@ export async function hydrate() {
         uptime: Number(r.uptime_s ?? 0),
         rssi: r.rssi,
         freeHeap: r.free_heap,
+        // Declared telemetry cadence, so per-node staleness survives a restart
+        // rather than reverting to the global default for a node we already
+        // know publishes slowly.
+        tlmIntervalMs: r.tlm_interval_ms ?? null,
         systemFault: 0,
         lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
         modules: [],
@@ -363,6 +368,20 @@ async function persistReading(port, value, status) {
       [port._uuid, value, status]
     );
   });
+}
+
+// Store the node's declared publish cadence. Separate from persistDeviceState
+// because it changes once at provisioning rather than on every packet, and
+// writing it with the hot path would mean an UPDATE per telemetry message for
+// a value that almost never changes.
+export async function persistTlmInterval(node, ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  if (node.tlmIntervalMs === ms) return;          // no change, no write
+  node.tlmIntervalMs = ms;
+  await withTenant(node._tenantUuid, (c) =>
+    c.query('UPDATE devices SET tlm_interval_ms = $2 WHERE device_id = $1',
+      [node._uuid, ms])).catch((e) =>
+    console.error('[store] persist tlm_interval failed:', e.message));
 }
 
 export async function persistDeviceState(dev) {
@@ -722,6 +741,10 @@ export function projectDevices(tenantId = null) {
           status: deriveModuleStatus({
             portStatuses: ports.map((p) => p.status),
             lastSeen: m.lastSeen, now,
+            // Same per-node threshold the ports were judged by, or a board on a
+            // slow-publishing node reads Offline while its own channels read
+            // Normal — the rollup contradicting the things it rolls up.
+            staleMs: staleMsFor(d, STALE_MS),
           }),
           ports,
         };

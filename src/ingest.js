@@ -11,11 +11,12 @@
 
 import {
   store, findNode, findNodeScoped, findPortByChannel, pushHistory,
-  applyCalibration, persistDeviceState, persistPortActive,
+  applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
   updateCommandStatus, setActuatorAck, addNotification,
 } from './store.js';
-import { derivePortStatus, deriveNodeStatus, describeConnState } from './status.js';
+import { derivePortStatus, deriveNodeStatus, describeConnState, STALE_MS } from './status.js';
 import { ensureDevice, ensureModule, ensurePort, touchPresence } from './provision.js';
+import { reconcileNode, checkTopologyConsistency, staleMsFor } from './reconcile.js';
 
 // Auto-provisioning: create inventory rows the first time real hardware
 // announces itself. Set AUTO_PROVISION=false to go back to strict declared-only
@@ -186,11 +187,35 @@ export async function ingestDiscovery(pkt) {
     }
   }
 
+  // The node's own publish cadence, when it declares one. Staleness is then
+  // derived per node instead of from a single global constant that cannot suit
+  // both a 10s node and a 60s low-power node.
+  if (Number.isFinite(Number(pkt.tlm_interval_ms))) {
+    persistTlmInterval(node, Number(pkt.tlm_interval_ms)).catch((e) =>
+      console.error('[ingest] persist tlm_interval failed:', e.message));
+  }
+
+  // Discovery is edge-triggered, so an absent board is ambiguous. Cross-check
+  // the node's own chip count before treating this as a full snapshot.
+  const topology = checkTopologyConsistency(node, pkt);
+
+  // Correct any drift between what the firmware is doing and what the operator
+  // asked for. Wrapped: a reconciliation problem must never reject a discovery
+  // packet, which is still good data regardless.
+  let drift = [];
+  try {
+    drift = await reconcileNode(node, pkt);
+  } catch (e) {
+    console.warn('[ingest] reconcile failed:', e.message);
+  }
+
   refreshNodeStatus(node, Date.now());
   return {
     ok: true, node: node.id, tenantScoped: scoped,
     detectedChips: pkt.detected_chips ?? null,
     connected, disconnected, disabled, unmatched, provisioned,
+    topology,
+    drift: drift.length ? drift : undefined,
   };
 }
 
@@ -241,10 +266,22 @@ export async function ingestAck(pkt) {
     }).catch((e) => console.error('[ingest] ack notification failed:', e.message));
   }
 
+  // An ack whose cid matches no logged command is an orphan. In normal
+  // operation this cannot happen — the backend stamps a cid on everything it
+  // issues — so it means a command injected by other means (a bench
+  // mosquitto_pub) or the firmware's `cid ? cid : "unknown"` fallback firing.
+  // Worth saying out loud: discarded silently, it looks like the hardware
+  // ignored the command.
+  if (!cmd) {
+    console.warn(`[ingest] orphan ack from ${node.id}: cid '${pkt.cid}' matches no ` +
+                 `logged command (status '${status}')`);
+  }
+
   return {
     ok: true, node: node.id, tenantScoped: scoped,
     cid: pkt.cid, status,
     matchedCommand: Boolean(cmd),
+    orphan: cmd ? undefined : true,
     actuator: actuator?.id ?? null,
     result: ACK_FAIL.has(status) ? 'fail' : (ACK_OK.has(status) ? 'ok' : 'unknown'),
   };
@@ -252,6 +289,14 @@ export async function ingestAck(pkt) {
 
 // Recompute one node's status from its ports + staleness.
 export function refreshNodeStatus(node, now = Date.now()) {
+  // Per-node staleness, derived from the cadence the node itself declared in
+  // discovery. A 10s node and a 60s low-power node cannot share one threshold:
+  // pick 30s and the slow node reads permanently offline; pick 180s and the
+  // fast node's outage goes unnoticed for three minutes. Falls back to the
+  // global STALE_MS for firmware that predates tlm_interval_ms, so nothing
+  // changes for nodes that don't declare one.
+  const staleMs = staleMsFor(node, STALE_MS);
+
   const portStatuses = [];
   for (const m of node.modules) {
     for (const p of m.ports) {
@@ -261,13 +306,13 @@ export function refreshNodeStatus(node, now = Date.now()) {
       p.status = derivePortStatus({
         code: p.code, value: p.value,
         safeMin: p.safeMin, safeMax: p.safeMax,
-        lastSeen: p.lastSeen, now,
+        lastSeen: p.lastSeen, now, staleMs,
       });
       portStatuses.push(p.status);
     }
   }
   node.status = deriveNodeStatus({
-    portStatuses, systemFault: node.systemFault, lastSeen: node.lastSeen, now,
+    portStatuses, systemFault: node.systemFault, lastSeen: node.lastSeen, now, staleMs,
   });
 }
 

@@ -80,8 +80,8 @@ export const STALE_MS = Number(process.env.STALE_MS ?? 30_000);
 // Resolve a single port's UI status from: its last health code, whether its
 // calibrated value sits inside the safe band, and how fresh the reading is.
 // Order mirrors the spec: gray(offline) → red(fault) → amber(warn) → green.
-export function derivePortStatus({ code, value, safeMin, safeMax, lastSeen, now = Date.now() }) {
-  if (lastSeen == null || now - lastSeen > STALE_MS) return 'Offline';
+export function derivePortStatus({ code, value, safeMin, safeMax, lastSeen, now = Date.now(), staleMs = STALE_MS }) {
+  if (lastSeen == null || now - lastSeen > staleMs) return 'Offline';
 
   const { severity } = describeCode(code ?? 0);
   if (severity === 'offline') return 'Offline';
@@ -106,8 +106,8 @@ const UI_TO_DEVICE = { Offline: 'offline', Fault: 'fault', Warning: 'warning', N
 //
 // Disabled channels are excluded: switching off an unwired input must not make
 // the board it sits on look degraded.
-export function deriveModuleStatus({ portStatuses, lastSeen, now = Date.now() }) {
-  if (lastSeen == null || now - lastSeen > STALE_MS) return 'offline';
+export function deriveModuleStatus({ portStatuses, lastSeen, now = Date.now(), staleMs = STALE_MS }) {
+  if (lastSeen == null || now - lastSeen > staleMs) return 'offline';
   const considered = portStatuses.filter((s) => s !== 'Disabled');
   if (!considered.length) return 'offline';   // board present but nothing monitored
 
@@ -126,8 +126,8 @@ export function deriveModuleStatus({ portStatuses, lastSeen, now = Date.now() })
 // fault flag (st.f, if the node ever sends one) and staleness. Returns the
 // frontend's device.status vocab (online | warning | fault | offline).
 
-export function deriveNodeStatus({ portStatuses, systemFault, lastSeen, now = Date.now() }) {
-  if (lastSeen == null || now - lastSeen > STALE_MS) return 'offline';
+export function deriveNodeStatus({ portStatuses, systemFault, lastSeen, now = Date.now(), staleMs = STALE_MS }) {
+  if (lastSeen == null || now - lastSeen > staleMs) return 'offline';
 
   // "Offline" at the NODE level means the node itself stopped reporting, which
   // the staleness check above already decided. Beyond that point the node is
