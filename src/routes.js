@@ -26,9 +26,8 @@ import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand, getMqttStats } from './mqtt.js';
 import { broadcastDevices, getRealtimeStats } from './realtime.js';
 import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } from './security.js';
-import { getPresenceStats, forgetEntity } from './presence.js';
+import { getPresenceStats } from './presence.js';
 import { getReconcileStats } from './reconcile.js';
-import { planMigration, migrateConfiguration, suggestReplacements, MigrationError } from './migrate.js';
 
 export const router = Router();
 
@@ -152,55 +151,6 @@ function resolveDevice(req, res) {
   }
   return dev;
 }
-
-// ── Device replacement ──────────────────────────────────────────────────────
-// The firmware derives its node id from the ESP32's MAC, so replacing a board —
-// or upgrading from the old hardcoded "N001" — produces a NEW device rather
-// than the same one reconnecting. Auto-provisioning brings the replacement up
-// within seconds, but every label, safe range and calibration assignment the
-// operator built stays attached to the retired device. These endpoints move it
-// across, matching channels by physical position (board address + port code)
-// since the UUIDs necessarily differ.
-
-// Candidate replacements for a retired node: same tenant, online, and ideally
-// still unconfigured.
-router.get('/devices/:deviceId/replacements', wrap(async (req, res) => {
-  const dev = resolveDevice(req, res);
-  if (!dev) return;
-  res.json({ ok: true, candidates: suggestReplacements(dev) });
-}));
-
-// Dry run. A migration overwrites the target's configuration, so the operator
-// gets to see exactly what would move before agreeing to it.
-router.post('/devices/:deviceId/migrate/preview', wrap(async (req, res) => {
-  const from = resolveDevice(req, res);
-  if (!from) return;
-  const to = findNode(req.body?.targetId);
-  try {
-    res.json({ ok: true, ...(await planMigration(from, to)) });
-  } catch (e) {
-    res.status(e instanceof MigrationError ? e.status : 400).json({ error: e.message });
-  }
-}));
-
-router.post('/devices/:deviceId/migrate', wrap(async (req, res) => {
-  const from = resolveDevice(req, res);
-  if (!from) return;
-  const to = findNode(req.body?.targetId);
-  try {
-    const result = await migrateConfiguration(from, to, {
-      removeSource: req.body?.removeSource === true,
-    });
-    // Drop the retired node from presence tracking, or it would keep its last
-    // announced status and a future node reusing that id would be compared
-    // against a state from before it existed.
-    if (result.sourceRemoved) forgetEntity(`node:${from.id}`);
-    broadcastDevices();
-    res.json({ ok: true, ...result });
-  } catch (e) {
-    res.status(e instanceof MigrationError ? e.status : 400).json({ error: e.message });
-  }
-}));
 
 router.patch('/devices/:deviceId', wrap(async (req, res) => {
   const dev = resolveDevice(req, res);

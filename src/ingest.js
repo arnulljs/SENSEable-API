@@ -187,9 +187,7 @@ export async function ingestDiscovery(pkt) {
     }
   }
 
-  // The node's own publish cadence, when it declares one. Staleness is then
-  // derived per node instead of from a single global constant that cannot suit
-  // both a 10s node and a 60s low-power node.
+  // The node's own publish cadence, when it declares one. Feeds staleMsFor().
   if (Number.isFinite(Number(pkt.tlm_interval_ms))) {
     persistTlmInterval(node, Number(pkt.tlm_interval_ms)).catch((e) =>
       console.error('[ingest] persist tlm_interval failed:', e.message));
@@ -289,12 +287,8 @@ export async function ingestAck(pkt) {
 
 // Recompute one node's status from its ports + staleness.
 export function refreshNodeStatus(node, now = Date.now()) {
-  // Per-node staleness, derived from the cadence the node itself declared in
-  // discovery. A 10s node and a 60s low-power node cannot share one threshold:
-  // pick 30s and the slow node reads permanently offline; pick 180s and the
-  // fast node's outage goes unnoticed for three minutes. Falls back to the
-  // global STALE_MS for firmware that predates tlm_interval_ms, so nothing
-  // changes for nodes that don't declare one.
+  // Per-node staleness; see staleMsFor() in reconcile.js for why one global
+  // threshold cannot serve both a fast and a low-power node.
   const staleMs = staleMsFor(node, STALE_MS);
 
   const portStatuses = [];

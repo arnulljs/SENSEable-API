@@ -18,8 +18,6 @@
 // frozen wire protocol. A precise comment carries the same information without
 // touching either.
 
-export const shorthands = undefined;
-
 export async function up(pgm) {
   pgm.sql(`
     COMMENT ON COLUMN actuators.dur IS

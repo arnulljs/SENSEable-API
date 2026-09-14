@@ -74,7 +74,7 @@ export async function withTenant(tenantId, fn) {
 }
 
 /** One-off tenant-scoped query. */
-export async function tenantQuery(tenantId, text, params = []) {
+async function tenantQuery(tenantId, text, params = []) {
   return withTenant(tenantId, (c) => c.query(text, params));
 }
 

@@ -63,7 +63,7 @@ function raise(node, type, title, message) {
  * Call AFTER refreshNodeStatus() has recomputed statuses, so this reads settled
  * values rather than racing the computation that produces them.
  */
-export function checkPresence(node) {
+function checkPresence(node) {
   const nKey = nodeKey(node);
   const nPrev = lastState.get(nKey);
   const nNow = node.status;
@@ -166,17 +166,6 @@ export function checkAllPresence() {
   for (const node of store.devices) {
     try { checkPresence(node); }
     catch (e) { console.error(`[presence] ${node.id}:`, e.message); }
-  }
-}
-
-/**
- * Forget a removed entity so that re-adding the same hardware later is treated
- * as a genuine new arrival rather than compared against a stale status from
- * before it was removed.
- */
-export function forgetEntity(prefix) {
-  for (const k of [...lastState.keys()]) {
-    if (k.startsWith(prefix)) { lastState.delete(k); known.delete(k); }
   }
 }
 

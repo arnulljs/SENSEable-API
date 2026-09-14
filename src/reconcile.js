@@ -47,16 +47,15 @@
 // discovery repeats; a correction lost to a dropped broker connection is simply
 // re-derived from the next discovery packet.
 
-import { store } from './store.js';
+import { store, recordCommand } from './store.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand } from './mqtt.js';
-import { recordCommand } from './store.js';
 
 // Don't re-issue the same correction faster than this. A node that is ignoring
 // the command (wrong firmware, dead I2C bus) would otherwise get a fresh one on
 // every discovery packet, and the command log would fill with identical rows
 // that tell you nothing you didn't know after the first.
-const REISSUE_COOLDOWN_MS = Number(process.env.RECONCILE_COOLDOWN_MS ?? 60_000);
+const REISSUE_COOLDOWN_MS = 60_000;
 
 // key -> timestamp of last correction attempt
 const lastAttempt = new Map();
@@ -103,7 +102,14 @@ export async function reconcileNode(node, pkt) {
       // value is "no instruction given" and never counts as drift.
       const operatorDisabled = port.enabled === false;
 
-      if (firmwareDisabled === operatorDisabled) continue;
+      const key2 = `${node.id}::${mod.address}::${ch}`;
+
+      if (firmwareDisabled === operatorDisabled) {
+        // Agreed. Drop any cooldown entry so a genuine future drift isn't
+        // suppressed by one left over from an old correction.
+        lastAttempt.delete(key2);
+        continue;
+      }
 
       stats.drifted += 1;
       drift.push({
@@ -114,7 +120,6 @@ export async function reconcileNode(node, pkt) {
         intent: operatorDisabled ? 'disabled' : 'enabled',
       });
 
-      const key2 = `${node.id}::${mod.address}::${ch}`;
       const now = Date.now();
       const prev = lastAttempt.get(key2);
       if (prev && now - prev < REISSUE_COOLDOWN_MS) {
@@ -134,14 +139,6 @@ export async function reconcileNode(node, pkt) {
         console.warn(`[reconcile] ${node.id} ${mod.address}/p${ch}: could not re-issue —`, e.message);
       }
     }
-  }
-
-  // Once firmware and intent agree, forget the entry so a genuine future drift
-  // isn't suppressed by a cooldown left over from an old correction.
-  for (const [k, t] of [...lastAttempt]) {
-    if (!k.startsWith(`${node.id}::`)) continue;
-    const stillDrifting = drift.some((d) => k === `${node.id}::${d.address}::${d.channel}`);
-    if (!stillDrifting && Date.now() - t > REISSUE_COOLDOWN_MS) lastAttempt.delete(k);
   }
 
   return drift;
@@ -199,15 +196,10 @@ export function checkTopologyConsistency(node, pkt) {
 }
 
 /**
- * Per-node staleness threshold, derived from the node's declared publish
- * cadence rather than a single global constant.
- *
- * A node publishing every 10 s and one publishing every 60 s to save power
- * cannot share one threshold: pick 30 s and the slow node is permanently
- * "offline"; pick 180 s and the fast node's outage goes unnoticed for three
- * minutes. Three missed publishes is the standard tolerance — long enough to
- * absorb a Wi-Fi hiccup or an I2C bus recovery holding the mutex, short enough
- * to be useful.
+ * Per-node staleness threshold: three missed publishes at the cadence the node
+ * declared in discovery. One global threshold cannot serve both a 10 s node and
+ * a 60 s low-power node — pick 30 s and the slow one reads permanently offline,
+ * pick 180 s and the fast one's outage goes unnoticed for three minutes.
  *
  * Falls back to the global STALE_MS when the node hasn't declared an interval,
  * so firmware that predates `tlm_interval_ms` behaves exactly as before.

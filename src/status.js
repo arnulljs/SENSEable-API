@@ -12,42 +12,16 @@
 //   2  FAULT_OOR         voltage saturated the ADC registers (±32760)
 //   3  HARDWARE_OFFLINE  I2C line fault / comm drop (node reports -9999)
 //
-// The old wide "spec dictionary" (SYS_NORMAL / CELLULAR_ACTIVE / ...) mis-read
-// code 1 as CELLULAR_ACTIVE, which is wrong under the frozen schema. It's kept
-// below ONLY as a legacy profile you can opt into with STATUS_PROFILE=legacy;
-// the default is the schema table.
-
-export const STATUS_PROFILE =
-  process.env.STATUS_PROFILE === 'legacy' ? 'legacy' : 'schema';
-
 // --- Frozen telemetry status codes (adc[].p[] third element) ----------------
-export const SCHEMA_CODES = {
+const SCHEMA_CODES = {
   0: { name: 'NORMAL',           severity: 'normal'  },
   1: { name: 'OPEN',             severity: 'offline' }, // unplugged / floating
   2: { name: 'FAULT_OOR',        severity: 'fault'   }, // ADC saturation
   3: { name: 'HARDWARE_OFFLINE', severity: 'offline' }, // I2C fault (-9999)
 };
 
-// Back-compat alias — earlier code imported FIRMWARE_CODES.
-export const FIRMWARE_CODES = SCHEMA_CODES;
-
-// --- Legacy wide dictionary (opt-in via STATUS_PROFILE=legacy) ---------------
-export const LEGACY_CODES = {
-  0: { name: 'SYS_NORMAL',           severity: 'normal'  },
-  1: { name: 'CELLULAR_ACTIVE',      severity: 'normal'  },
-  2: { name: 'I2C_BUS_TIMEOUT',      severity: 'warning' },
-  3: { name: 'DRV_THERMAL_SHUTDOWN', severity: 'fault'   },
-  4: { name: 'ADC_CONV_TIMEOUT',     severity: 'fault'   },
-  5: { name: 'PORT_OPEN_CIRCUIT',    severity: 'offline' },
-  6: { name: 'RAIL_VOLTAGE_FLUC',    severity: 'fault'   },
-  7: { name: 'RSSI_CRITICAL',        severity: 'warning' },
-  8: { name: 'HEAP_EXHAUST_WARN',    severity: 'warning' },
-  9: { name: 'EEPROM_WRITE_FAIL',    severity: 'warning' },
-};
-
-export function describeCode(code) {
-  const table = STATUS_PROFILE === 'legacy' ? LEGACY_CODES : SCHEMA_CODES;
-  return table[code] ?? { name: `UNKNOWN_${code}`, severity: 'warning' };
+function describeCode(code) {
+  return SCHEMA_CODES[code] ?? { name: `UNKNOWN_${code}`, severity: 'warning' };
 }
 
 // --- Discovery connection states (disco buses[].ports.pN) -------------------

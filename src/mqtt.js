@@ -62,7 +62,7 @@ const stats = {
   lastRejectReason: null,
 };
 
-export function getMqttClient() {
+function getMqttClient() {
   return client;
 }
 

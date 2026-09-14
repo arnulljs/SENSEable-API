@@ -30,16 +30,25 @@
 
 import { withTenant, adminPool } from '../db/pool.js';
 import { applyCalibration } from './calibration.js';
-import { fmtTs } from './read.js';
 import { STALE_MS, deriveModuleStatus } from './status.js';
 import { staleMsFor } from './reconcile.js';
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
 
-// Display formatting lives in read.js so BOTH tiers format identically. Left
-// local, toLocaleString() uses the host timezone — UTC+8 on the on-site edge
-// server, UTC on a Vercel function — and the same reading would render eight
-// hours apart depending on which tier served it.
+// Display timestamp formatting. Both tiers must format identically, so the
+// timezone is explicit: left to the host, toLocaleString() would render the
+// same reading eight hours apart on the UTC+8 edge server and a UTC Vercel
+// function.
+const TZ = process.env.DISPLAY_TZ ?? 'Asia/Manila';
+
+export function fmtTs(d) {
+  return d.toLocaleString('en-US', {
+    month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true,
+    timeZone: TZ,
+  });
+}
+
 
 
 export const deviceKey = (slug, nodeId) => `${slug}:${nodeId}`;
@@ -465,7 +474,7 @@ const portNumOf = (p) => {
   return m ? Number(m[1]) : NaN;
 };
 
-export function findActuator(node, idOrPort) {
+function findActuator(node, idOrPort) {
   const acts = node?.actuators ?? [];
   const asNum = portNumOf(idOrPort);
   return (
@@ -687,7 +696,7 @@ export async function saveMapSensors(sensors) {
   return store.mapSensors;
 }
 
-export function resolvePort(deviceId, moduleId, portId) {
+function resolvePort(deviceId, moduleId, portId) {
   const d = store.devices.find((x) => x.id === deviceId);
   const m = d?.modules.find((x) => x.id === moduleId);
   return m?.ports.find((x) => x.id === portId) ?? null;
@@ -700,10 +709,10 @@ export function resolvePort(deviceId, moduleId, portId) {
 // the ONLY thing that gates deletion: you may remove hardware that has gone
 // quiet, never hardware that is live. Exposing it per entity lets the UI show or
 // hide each remove button without a second round-trip.
-export const isPortActive   = (p, now = Date.now()) => p.lastSeen != null && now - p.lastSeen <= STALE_MS;
-export const isModuleActive = (m, now = Date.now()) =>
+const isPortActive   = (p, now = Date.now()) => p.lastSeen != null && now - p.lastSeen <= STALE_MS;
+const isModuleActive = (m, now = Date.now()) =>
   (m.lastSeen != null && now - m.lastSeen <= STALE_MS) || m.ports.some((p) => isPortActive(p, now));
-export const isDeviceActive = (d, now = Date.now()) =>
+const isDeviceActive = (d, now = Date.now()) =>
   (d.lastSeen != null && now - d.lastSeen <= STALE_MS) || d.modules.some((m) => isModuleActive(m, now));
 
 export function projectDevices(tenantId = null) {

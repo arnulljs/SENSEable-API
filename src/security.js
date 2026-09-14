@@ -233,7 +233,7 @@ export function apiKeyGate(req, res, next) {
 // request that named no tenant at all silently wrote into whichever tenant
 // happened to be first in the map. That is a cross-tenant write caused by an
 // omission rather than an attack.
-export function requireTenant(getTenant) {
+function requireTenant(getTenant) {
   return function guard(req, res, next) {
     const slug = getTenant(req);
     if (!slug) {
