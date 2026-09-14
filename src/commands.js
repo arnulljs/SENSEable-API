@@ -91,6 +91,24 @@ export function buildActuate({ tid, nid, port, mode, state, duty, dur = 0, cid, 
     const dy = reqInt(duty, 'duty');
     if (dy < 0 || dy > 255) throw new Error('duty must be 0..255 (8-bit) for mode "pwm"');
     cmd.duty = dy;
+
+    // Forward an explicit state:0 in PWM mode as well.
+    //
+    // The firmware gained a guard that treats state:0 as an unconditional STOP
+    // regardless of duty — precisely so a stop carrying a stale duty cannot
+    // re-drive the output. That guard is unreachable if we drop the field here,
+    // which is what this branch used to do: `state` was only ever set for
+    // mode "bin", so a PWM stop arrived as {mode:"pwm", duty:N} and the
+    // firmware had nothing to act on but the duty.
+    //
+    // Only 0 is forwarded. A PWM "on" is expressed by its duty, so passing
+    // state:1 alongside would create a second, redundant way to say the same
+    // thing — and two sources of truth for one fact is what caused this class
+    // of bug in the first place.
+    if (state != null) {
+      const s = reqInt(state, 'state');
+      if (s === 0) cmd.state = 0;
+    }
   }
   return cmd;
 }
