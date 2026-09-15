@@ -117,7 +117,7 @@ async function describe(table) {
   if (schemaCache.has(table)) return schemaCache.get(table);
 
   const { rows: cols } = await localPool.query(
-    `SELECT column_name, is_identity
+    `SELECT column_name, is_identity, data_type
        FROM information_schema.columns
       WHERE table_schema='public' AND table_name=$1
       ORDER BY ordinal_position`, [table]);
@@ -136,10 +136,37 @@ async function describe(table) {
     // stays meaningful and rows don't duplicate on re-push.
     hasAlwaysIdentity: cols.some((c) => c.is_identity === 'YES'),
     identity: cols.filter((c) => c.is_identity === 'YES').map((c) => c.column_name),
+    // Timestamp columns need special handling on the way OUT — see selectList().
+    tsCols: cols.filter((c) => c.data_type.startsWith('timestamp')).map((c) => c.column_name),
     pk: pk.map((r) => r.attname),
   };
   schemaCache.set(table, meta);
   return meta;
+}
+
+/**
+ * Column list for a replication SELECT, with every timestamp cast to text.
+ *
+ * node-postgres parses a timestamptz into a JavaScript Date, and a Date holds
+ * MILLISECONDS. Postgres stores MICROSECONDS. So a plain `SELECT *` silently
+ * truncates 15:31:52.149413 to 15:31:52.149 before the value ever reaches the
+ * INSERT — the driver is lossy, not the database.
+ *
+ * That was survivable when `ts` was only carried alongside a row identified by
+ * its bigint id. It is not survivable now: (port_id, ts) IS the identity of a
+ * reading. A round trip that alters ts gives the same physical sample two
+ * identities, so the pull-down inserts a near-duplicate of every row it already
+ * has, forever.
+ *
+ * Casting to text on the way out sidesteps the Date entirely. The value travels
+ * as '2026-09-10 15:31:52.149413+08' and Postgres reparses it at full precision
+ * on the way in.
+ */
+function selectList(meta) {
+  const ts = new Set(meta.tsCols);
+  return meta.columns
+    .map((c) => (ts.has(c) ? `"${c}"::text AS "${c}"` : `"${c}"`))
+    .join(', ');
 }
 
 // ── Watermarks ──────────────────────────────────────────────────────────────
@@ -290,7 +317,8 @@ async function syncQueue(table, meta, q) {
   let total = 0;
   for (;;) {
     const { rows } = await localPool.query(
-      `SELECT * FROM "${table}" WHERE NOT "${q.flag}" ORDER BY "${q.id}" LIMIT $1`,
+      `SELECT ${selectList(meta)} FROM "${table}"
+        WHERE NOT "${q.flag}" ORDER BY "${q.id}" LIMIT $1`,
       [BATCH]);
     if (!rows.length) break;
 
@@ -339,7 +367,7 @@ async function syncTimestamp(table, meta, dir = {}) {
     // ordering only needs to be CONSISTENT, not semantically numeric, because
     // it serves purely as a tie-breaker within an identical timestamp.
     const { rows } = await src.query(
-      `SELECT *, updated_at::text AS _wm_at, "${pk}"::text AS _wm_key
+      `SELECT ${selectList(meta)}, updated_at::text AS _wm_at, "${pk}"::text AS _wm_key
          FROM "${table}"
         WHERE (updated_at, "${pk}"::text) > ($1::timestamptz, $2)
         ORDER BY updated_at, "${pk}"::text
@@ -362,7 +390,7 @@ async function syncStatic(table, meta, dir = {}) {
   // nothing and removes the need for a change marker on a table that has none.
   const src = dir.src ?? localPool;
   const dest = dir.dest ?? cloudPool;
-  const { rows } = await src.query(`SELECT * FROM "${table}"`);
+  const { rows } = await src.query(`SELECT ${selectList(meta)} FROM "${table}"`);
   const n = await push(table, rows, meta, 'timestamp', { dest });
   await setWatermark(dir.wmKey ?? table, { added: 0 });
   return n;
@@ -392,7 +420,7 @@ async function pullQueue(table, meta, q) {
 
   for (;;) {
     const { rows } = await cloudPool.query(
-      `SELECT * FROM "${table}"
+      `SELECT ${selectList(meta)} FROM "${table}"
         WHERE "${q.id}" > $1 ${q.pullWhere ? `AND ${q.pullWhere}` : ''}
         ORDER BY "${q.id}" LIMIT $2`,
       [cursor, BATCH]);
