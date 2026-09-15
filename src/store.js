@@ -353,24 +353,43 @@ export function findPortByChannel(node, moduleAddress, channelIndex) {
 // ── Write-through ───────────────────────────────────────────────────────────
 // Persist a reading and the port's latest state. Fire-and-forget: a DB hiccup
 // must never stall or crash telemetry ingest, so it logs and moves on.
-export function pushHistory(port, value, status) {
-  port.history.push({ timestamp: fmtTs(new Date()), value, status });
+/**
+ * Append a sample to the in-memory ring and persist it.
+ *
+ * @param opts.origin 'cloud' when the packet arrived over the CLOUD broker (the
+ *   normal cloud-first path, so Supabase already has it or is about to), or
+ *   'local' when it arrived over the LOCAL broker during failover, which means
+ *   this row is the only copy in existence and the cloud is owed it.
+ * @param opts.ts  device-supplied sample instant. Falls back to ingest time.
+ */
+export function pushHistory(port, value, status, opts = {}) {
+  const at = opts.ts instanceof Date ? opts.ts : new Date();
+  port.history.push({ timestamp: fmtTs(at), value, status });
   if (port.history.length > HISTORY_CAP) {
     port.history.splice(0, port.history.length - HISTORY_CAP);
   }
-  persistReading(port, value, status).catch((e) =>
+  persistReading(port, value, status, at, opts.origin ?? 'cloud').catch((e) =>
     console.error('[store] persist reading failed:', e.message)
   );
 }
 
-async function persistReading(port, value, status) {
+// Which tier this process is. On the cloud tier nothing is ever "owed" upward,
+// so every row is born synced regardless of which broker delivered it.
+const IS_CLOUD_TIER = process.env.TIER === 'cloud';
+
+async function persistReading(port, value, status, at, origin) {
   const dev = deviceOfPort(port);
   if (!dev) return;
+  // A 'cloud'-origin row on the edge is a MIRROR of something the cloud already
+  // holds. Marking it synced is what stops sync.js from pushing it straight back
+  // up, which would be an echo loop with the ingest path.
+  const synced = IS_CLOUD_TIER || origin === 'cloud';
   await withTenant(dev._tenantUuid, async (c) => {
     await c.query(
-      `INSERT INTO readings(port_id, tenant_id, raw_adc, value, status)
-       VALUES ($1,$2,$3,$4,$5)`,
-      [port._uuid, dev._tenantUuid, port.raw ?? 0, value, status]
+      `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (port_id, ts) DO NOTHING`,
+      [port._uuid, dev._tenantUuid, at, port.raw ?? 0, value, status, origin, synced]
     );
     await c.query(
       `UPDATE ports SET last_value=$2, last_status=$3 WHERE port_id=$1`,
@@ -576,9 +595,11 @@ async function persistActuator(node, act) {
 export async function addNotification(node, { type, title, message }) {
   const { rows } = await withTenant(node._tenantUuid, (c) =>
     c.query(
-      `INSERT INTO notifications(tenant_id, type, title, message)
-       VALUES ($1,$2,$3,$4) RETURNING notification_id, created_at`,
-      [node._tenantUuid, type, title, message]
+      // synced follows the same rule as readings: on the cloud tier a row is
+      // born final, on the edge it is owed upward until sync.js drains it.
+      `INSERT INTO notifications(tenant_id, type, title, message, synced)
+       VALUES ($1,$2,$3,$4,$5) RETURNING notification_id, created_at`,
+      [node._tenantUuid, type, title, message, IS_CLOUD_TIER]
     ));
   store.notifications.unshift({
     id: rows[0].notification_id, tenantId: node.tenantId, type, title, message,

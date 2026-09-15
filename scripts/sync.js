@@ -34,6 +34,10 @@ const ONCE = args.has('--once');
 const STATUS = args.has('--status');
 const BACKFILL = args.has('--backfill');
 const DRY = args.has('--dry-run');
+// The downward (cloud → edge) pass. On by default because cloud-first means the
+// cloud is where telemetry lands; set SYNC_PULL=false or pass --no-pull to run
+// the worker in the legacy one-way edge → cloud mode.
+const PULL = !args.has('--no-pull') && process.env.SYNC_PULL !== 'false';
 
 const INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 30_000);
 const BATCH = Number(process.env.SYNC_BATCH_SIZE ?? 500);
@@ -56,8 +60,24 @@ const TABLES = [
   { name: 'calibration_formulas', strategy: 'timestamp' },
   { name: 'ports',                strategy: 'timestamp' },
   { name: 'actuators',            strategy: 'timestamp' },
-  { name: 'readings',             strategy: 'identity'  },
-  { name: 'notifications',        strategy: 'identity'  },
+  // QUEUE tables are the failover backlog. Their bigint identity PK is now
+  // minted independently on BOTH tiers (the cloud ingests live, the edge
+  // ingests during an outage), so it can no longer be carried across or used as
+  // a conflict target — it is dropped on the wire and the destination assigns
+  // its own. `synced` is the queue: a row leaves it only once the cloud has
+  // confirmed it.
+  { name: 'readings',             strategy: 'queue',
+    queue: { flag: 'synced', id: 'reading_id',
+             omit: ['reading_id'], conflict: 'port_id, ts',
+             // Do not pull back rows this edge itself pushed up. They are
+             // already here by definition, and fetching them just to have every
+             // one bounce off the unique index wastes a WAN round trip per
+             // batch during backlog recovery.
+             pullWhere: "origin = 'cloud'" } },
+  { name: 'notifications',        strategy: 'queue',
+    queue: { flag: 'synced', id: 'notification_id',
+             omit: ['notification_id'], conflict: 'event_uid',
+             pullWhere: null } },
   { name: 'map_profiles',         strategy: 'timestamp' },
   { name: 'map_sensors',          strategy: 'timestamp' },
   { name: 'commands',             strategy: 'timestamp' },
@@ -115,6 +135,7 @@ async function describe(table) {
     // says OVERRIDING SYSTEM VALUE — and we must preserve ids so the watermark
     // stays meaningful and rows don't duplicate on re-push.
     hasAlwaysIdentity: cols.some((c) => c.is_identity === 'YES'),
+    identity: cols.filter((c) => c.is_identity === 'YES').map((c) => c.column_name),
     pk: pk.map((r) => r.attname),
   };
   schemaCache.set(table, meta);
@@ -149,67 +170,158 @@ async function setWatermark(table, { id, at, key, added, error }) {
     [table, id ?? null, at ?? null, key ?? null, added ?? 0, error ?? null]);
 }
 
-// ── Push a batch of rows to the cloud ───────────────────────────────────────
-async function push(table, rows, meta, mode) {
+// ── Push a batch of rows to a destination ───────────────────────────────────
+// Direction is a parameter now, not an assumption. Cloud-first makes
+// configuration flow DOWN (the dashboard writes to Supabase; the edge needs
+// calibration and inventory locally to keep converting raw counts during an
+// outage) while the failover backlog flows UP. Same upsert either way.
+async function push(table, rows, meta, mode, opts = {}) {
   if (!rows.length) return 0;
 
-  const cols = meta.columns;
+  const dest = opts.dest ?? cloudPool;
+  const omit = new Set(opts.omit ?? []);
+  const cols = meta.columns.filter((c) => !omit.has(c));
+  const override = opts.override ?? {};
+
   const quoted = cols.map((c) => `"${c}"`).join(', ');
   const params = [];
   const tuples = rows.map((row) => {
     const slots = cols.map((c) => {
-      params.push(row[c]);
+      params.push(c in override ? override[c] : row[c]);
       return `$${params.length}`;
     });
     return `(${slots.join(', ')})`;
   });
 
-  const overriding = meta.hasAlwaysIdentity ? 'OVERRIDING SYSTEM VALUE' : '';
-  const conflict = meta.pk.map((c) => `"${c}"`).join(', ');
+  // An identity column can only be written explicitly with OVERRIDING SYSTEM
+  // VALUE — and only when we are actually carrying it. Queue tables omit it on
+  // purpose so the destination mints its own, which is what makes two
+  // independently-numbering tiers safe to merge.
+  const carriesIdentity = meta.hasAlwaysIdentity && cols.some((c) => meta.identity.includes(c));
+  const overriding = carriesIdentity ? 'OVERRIDING SYSTEM VALUE' : '';
+
+  // Conflict target: the primary key for replicated rows that carry their id,
+  // a NATURAL key for queue rows that do not.
+  const conflict = opts.conflict ?? meta.pk.map((c) => `"${c}"`).join(', ');
+  const keyCols = opts.conflict
+    ? opts.conflict.split(',').map((c) => c.trim().replace(/"/g, ''))
+    : meta.pk;
 
   // Append-only rows never change, so a collision means "already replicated" —
-  // skip it. Mutable rows must overwrite, or an edit made locally would never
-  // reach the cloud copy.
-  const action = mode === 'identity'
+  // skip it. Mutable rows must overwrite, or an edit made on one side would
+  // never reach the other.
+  const updatable = cols.filter((c) => !keyCols.includes(c));
+  // The WHERE turns a no-op upsert into a genuine no-op: without it every pass
+  // rewrites every row it offers, rowCount always equals the batch size, and the
+  // worker reports (and NOTIFYs) work it did not do. With a downward pass added
+  // that noise doubled — `roles` alone woke every dashboard socket every tick.
+  const action = (mode === 'identity' || mode === 'queue') || !updatable.length
     ? 'DO NOTHING'
-    : `DO UPDATE SET ${cols.filter((c) => !meta.pk.includes(c))
-        .map((c) => `"${c}" = EXCLUDED."${c}"`).join(', ')}`;
+    : `DO UPDATE SET ${updatable.map((c) => `"${c}" = EXCLUDED."${c}"`).join(', ')}
+       WHERE _t.* IS DISTINCT FROM EXCLUDED.*`;
 
-  const sql = `INSERT INTO "${table}" (${quoted}) ${overriding}
+  const sql = `INSERT INTO "${table}" AS _t (${quoted}) ${overriding}
                VALUES ${tuples.join(', ')}
                ON CONFLICT (${conflict}) ${action}`;
 
   if (DRY) return rows.length;
-  await cloudPool.query(sql, params);
-  return rows.length;
+
+  // app.sync_replay tells set_updated_at() to preserve the source timestamp
+  // rather than stamping now(). Without it a replicated row looks freshly
+  // edited to the OTHER direction's watermark and bounces back on the next
+  // pass, forever. SET LOCAL scopes it to this transaction only.
+  const client = await dest.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SET LOCAL app.sync_replay = 'on'");
+    const result = await client.query(sql, params);
+    await client.query('COMMIT');
+    // Report what actually LANDED, not what was offered. A row that bounces off
+    // the unique index was already there, and counting it as replicated makes
+    // the log claim work that did not happen.
+    return result.rowCount ?? 0;
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 // ── Per-strategy sync ───────────────────────────────────────────────────────
-async function syncIdentity(table, meta) {
-  const wm = await getWatermark(table);
-  const since = wm.last_synced_id ?? 0;
-  const idCol = meta.pk[0];
 
+// QUEUE: the failover backlog. Rows the cloud does not have yet, drained in
+// primary-key order and marked only once the destination has accepted them.
+//
+// This replaces the old identity-watermark strategy, which cannot survive
+// cloud-first. Under it, `readings` shipped its locally-minted reading_id with
+// OVERRIDING SYSTEM VALUE and conflicted on that id. Now that the cloud mints
+// its own ids for live telemetry, an edge failover row would arrive carrying an
+// id the cloud had already issued to a DIFFERENT reading, hit
+// ON CONFLICT DO NOTHING, and be silently discarded — a backlog that reports
+// success and loses every row. The id is dropped on the wire instead and the
+// conflict target is the natural key (port_id, ts).
+// The destination mints its own id for queue rows, which only works if its
+// SEQUENCE knows how far the table already goes.
+//
+// It usually does not. Under the old topology every replicated row arrived with
+// an explicit id via OVERRIDING SYSTEM VALUE, and an explicit insert does NOT
+// advance the identity sequence. So a cloud table holding 20,000 rows can still
+// have its sequence sitting at 1. The first row that asks for a generated id
+// gets 1, collides with the primary key, and the whole batch fails with
+// "duplicate key value violates unique constraint" — which looks like a data
+// problem and is really a bookkeeping one.
+//
+// setval() to the current maximum is idempotent and costs one indexed lookup,
+// so it runs once per table per pass rather than being a one-off repair someone
+// has to remember.
+async function alignSequence(dest, table, idCol) {
+  if (DRY) return;
+  await dest.query(
+    `SELECT setval(
+       pg_get_serial_sequence($1, $2),
+       GREATEST(coalesce((SELECT max("${idCol}") FROM "${table}"), 0), 1))
+     WHERE pg_get_serial_sequence($1, $2) IS NOT NULL`,
+    [table, idCol]);
+}
+
+async function syncQueue(table, meta, q) {
+  await alignSequence(cloudPool, table, q.id);
   let total = 0;
-  let cursor = since;
   for (;;) {
     const { rows } = await localPool.query(
-      `SELECT * FROM "${table}" WHERE "${idCol}" > $1 ORDER BY "${idCol}" LIMIT $2`,
-      [cursor, BATCH]);
+      `SELECT * FROM "${table}" WHERE NOT "${q.flag}" ORDER BY "${q.id}" LIMIT $1`,
+      [BATCH]);
     if (!rows.length) break;
 
-    total += await push(table, rows, meta, 'identity');
-    cursor = rows[rows.length - 1][idCol];
-    // Checkpoint each batch: an interrupted pass resumes mid-backlog instead of
-    // restarting, which matters when a long outage leaves thousands of rows.
-    await setWatermark(table, { id: cursor, added: rows.length });
+    // Push FIRST, mark second. If the push throws, nothing is marked and the
+    // same rows are retried next pass — the backlog is never lost to a
+    // half-finished transfer.
+    await push(table, rows, meta, 'queue', { omit: q.omit, conflict: q.conflict });
+
+    if (!DRY) {
+      await localPool.query(
+        `UPDATE "${table}" SET "${q.flag}" = true WHERE "${q.id}" = ANY($1::bigint[])`,
+        [rows.map((r) => r[q.id])]);
+    }
+    total += rows.length;
+    await setWatermark(table, { added: rows.length });
+
     if (rows.length < BATCH) break;
+    if (DRY) break;            // dry-run marks nothing, so it would loop forever
   }
   return total;
 }
 
-async function syncTimestamp(table, meta) {
-  const wm = await getWatermark(table);
+// TIMESTAMP: mutable rows, chased by (updated_at, pk) and applied as an upsert.
+// Direction is a parameter — configuration flows DOWN under cloud-first, while
+// everything else still flows up.
+async function syncTimestamp(table, meta, dir = {}) {
+  const src = dir.src ?? localPool;
+  const dest = dir.dest ?? cloudPool;
+  const wmKey = dir.wmKey ?? table;
+
+  const wm = await getWatermark(wmKey);
   // Epoch on first run ⇒ everything is "changed since", i.e. a full seed.
   let curAt = wm.last_synced_at ?? '1970-01-01 00:00:00+00';
   let curKey = wm.last_synced_key ?? '';
@@ -226,7 +338,7 @@ async function syncTimestamp(table, meta) {
     // pk is cast to text so one code path covers both uuid and bigint keys; the
     // ordering only needs to be CONSISTENT, not semantically numeric, because
     // it serves purely as a tie-breaker within an identical timestamp.
-    const { rows } = await localPool.query(
+    const { rows } = await src.query(
       `SELECT *, updated_at::text AS _wm_at, "${pk}"::text AS _wm_key
          FROM "${table}"
         WHERE (updated_at, "${pk}"::text) > ($1::timestamptz, $2)
@@ -235,23 +347,74 @@ async function syncTimestamp(table, meta) {
       [curAt, curKey, BATCH]);
     if (!rows.length) break;
 
-    total += await push(table, rows, meta, 'timestamp');
+    total += await push(table, rows, meta, 'timestamp', { dest });
     const last = rows[rows.length - 1];
     curAt = last._wm_at;
     curKey = last._wm_key;
-    await setWatermark(table, { at: curAt, key: curKey, added: rows.length });
+    await setWatermark(wmKey, { at: curAt, key: curKey, added: rows.length });
     if (rows.length < BATCH) break;
   }
   return total;
 }
 
-async function syncStatic(table, meta) {
+async function syncStatic(table, meta, dir = {}) {
   // Tiny immutable lookup (roles). Re-upserting the whole table each pass costs
   // nothing and removes the need for a change marker on a table that has none.
-  const { rows } = await localPool.query(`SELECT * FROM "${table}"`);
-  const n = await push(table, rows, meta, 'timestamp');
-  await setWatermark(table, { added: 0 });
+  const src = dir.src ?? localPool;
+  const dest = dir.dest ?? cloudPool;
+  const { rows } = await src.query(`SELECT * FROM "${table}"`);
+  const n = await push(table, rows, meta, 'timestamp', { dest });
+  await setWatermark(dir.wmKey ?? table, { added: 0 });
   return n;
+}
+
+// ── Downward pass: closing the mirror gap ───────────────────────────────────
+// The edge is a MIRROR under cloud-first, and a mirror built only from a live
+// MQTT subscription has permanent holes: if the edge loses its own WAN link
+// while a cellular node keeps publishing to the cloud, that telemetry lands in
+// Supabase and the edge simply never hears it. MQTT will not replay it.
+//
+// So the edge pulls down what it missed, using the same watermark machinery in
+// reverse. Watermarks are namespaced 'down:<table>' so the two directions never
+// share a cursor.
+//
+// Configuration comes down for a second reason: the dashboard writes to the
+// cloud now, and the edge needs calibration, safe ranges and inventory LOCALLY
+// or it cannot convert raw ADC counts during the next outage.
+async function pullQueue(table, meta, q) {
+  // Same problem in the other direction: the edge assigns ids for rows it pulls
+  // down, and its sequence is just as likely to be behind.
+  await alignSequence(localPool, table, q.id);
+  const wmKey = `down:${table}`;
+  const wm = await getWatermark(wmKey);
+  let cursor = wm.last_synced_id ?? 0;
+  let total = 0;
+
+  for (;;) {
+    const { rows } = await cloudPool.query(
+      `SELECT * FROM "${table}"
+        WHERE "${q.id}" > $1 ${q.pullWhere ? `AND ${q.pullWhere}` : ''}
+        ORDER BY "${q.id}" LIMIT $2`,
+      [cursor, BATCH]);
+    if (!rows.length) break;
+
+    // synced=true: a mirrored row is already in the cloud by definition, and
+    // marking it otherwise would push it straight back — the echo loop.
+    // origin='cloud' records that it arrived over the cloud path, which the
+    // dashboard surfaces to distinguish live data from recovered data.
+    await push(table, rows, meta, 'queue', {
+      dest: localPool,
+      omit: q.omit,
+      conflict: q.conflict,
+      override: { synced: true, origin: 'cloud' },
+    });
+
+    cursor = rows[rows.length - 1][q.id];
+    total += rows.length;
+    await setWatermark(wmKey, { id: cursor, added: rows.length });
+    if (rows.length < BATCH) break;
+  }
+  return total;
 }
 
 // ── One full pass ───────────────────────────────────────────────────────────
@@ -260,22 +423,49 @@ async function runOnce() {
   let moved = 0;
   const failures = [];
 
-  for (const { name, strategy } of TABLES) {
+  // ── UP: failover backlog and anything still authored on the edge ──────────
+  for (const { name, strategy, queue } of TABLES) {
     try {
       const meta = await describe(name);
       if (!meta.pk.length) { log(`  ${name}: no PK, skipped`); continue; }
 
-      const n = strategy === 'identity'  ? await syncIdentity(name, meta)
-              : strategy === 'static'    ? await syncStatic(name, meta)
-              :                            await syncTimestamp(name, meta);
+      const n = strategy === 'queue'   ? await syncQueue(name, meta, queue)
+              : strategy === 'static'  ? await syncStatic(name, meta)
+              :                          await syncTimestamp(name, meta);
       moved += n;
-      if (n) log(`  ${name}: ${n} row(s)${DRY ? ' (dry-run)' : ''}`);
+      if (n) log(`  ↑ ${name}: ${n} row(s)${DRY ? ' (dry-run)' : ''}`);
     } catch (err) {
       // One bad table must not abort the rest — a FK hiccup on `commands`
       // shouldn't stop telemetry from reaching the backup.
       failures.push(`${name}: ${err.message}`);
       await setWatermark(name, { error: err.message }).catch(() => {});
       log(`  ${name}: FAILED — ${err.message}`);
+    }
+  }
+
+  // ── DOWN: mirror what the cloud ingested while this edge was not listening ─
+  // Skipped entirely with --no-pull or SYNC_PULL=false, which is the right
+  // setting for a deployment still running edge-primary.
+  if (PULL) {
+    for (const { name, strategy, queue } of TABLES) {
+      try {
+        const meta = await describe(name);
+        if (!meta.pk.length) continue;
+
+        const n = strategy === 'queue'
+          ? await pullQueue(name, meta, queue)
+          : strategy === 'static'
+            ? await syncStatic(name, meta,
+                { src: cloudPool, dest: localPool, wmKey: `down:${name}` })
+            : await syncTimestamp(name, meta,
+                { src: cloudPool, dest: localPool, wmKey: `down:${name}` });
+        moved += n;
+        if (n) log(`  ↓ ${name}: ${n} row(s)${DRY ? ' (dry-run)' : ''}`);
+      } catch (err) {
+        failures.push(`down:${name}: ${err.message}`);
+        await setWatermark(`down:${name}`, { error: err.message }).catch(() => {});
+        log(`  ↓ ${name}: FAILED — ${err.message}`);
+      }
     }
   }
 

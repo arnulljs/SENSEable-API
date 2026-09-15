@@ -16,9 +16,11 @@
     "sync:once": "node scripts/sync.js --once",
     "sync:status": "node scripts/sync.js --status",
     "sync:backfill": "node scripts/sync.js --backfill",
-    "migrate:cloud": "node-pg-migrate -m db/migrations --envPath .env.cloud --database-url-var CLOUD_DATABASE_URL_OWNER",
+    "migrate:cloud": "node-pg-migrate -m db/migrations --envPath .env.cloud --database-url-var CLOUD_DATABASE_URL_OWNER_SESSION",
     "migrate": "node-pg-migrate -m db/migrations --envPath .env --database-url-var DATABASE_URL_OWNER",
-    "test:realtime": "node scripts/test-realtime.js"
+    "test:realtime": "node scripts/test-realtime.js",
+    "test:cloudfirst": "bash scripts/run-cloudfirst-tests.sh",
+    "test:dispatch": "node scripts/test-dispatch.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

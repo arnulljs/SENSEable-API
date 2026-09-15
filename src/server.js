@@ -5,6 +5,8 @@
 
 import express from 'express';
 import cors from 'cors';
+import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { securityHeaders, corsOptions, apiKeyGate, readLimiter } from './security.js';
 import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
@@ -12,6 +14,7 @@ import { refreshAll } from './ingest.js';
 import { hydrate } from './store.js';
 import { startRealtime, stopRealtime, broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
+import { dispatchPendingCommands } from './dispatch.js';
 import { closePool } from '../db/pool.js';
 
 const PORT = Number(process.env.PORT ?? 4000);
@@ -45,9 +48,35 @@ app.use('/api', apiKeyGate);
 app.use('/api', readLimiter);
 
 app.use('/api', router);
-app.get('/', (_req, res) =>
-  res.json({ service: 'senseable-backend', ok: true, api: '/api' })
-);
+
+// ── Failover dashboard ──────────────────────────────────────────────────────
+// Under cloud-first the operator normally uses the Vercel-hosted dashboard. That
+// build CANNOT fall back to this server on its own: the page is served over
+// https and a browser refuses to fetch http://192.168.x.x from an https origin
+// (mixed content — no CSP change or flag gets around it).
+//
+// So the edge serves its own copy of the SPA. During an outage the operator
+// opens http://<edge-host>:4000 on the LAN and gets a same-origin dashboard
+// talking to this server, which is also what makes the failover demonstrable
+// rather than merely described.
+//
+//   cd ../SENSEable && npm run build && cp -r dist ../SENSEable-API/public
+//
+// Set STATIC_DIR to point somewhere else. When the directory is absent the
+// server behaves exactly as before and just answers the JSON banner.
+const STATIC_DIR = process.env.STATIC_DIR ?? path.join(process.cwd(), 'public');
+
+if (existsSync(path.join(STATIC_DIR, 'index.html'))) {
+  app.use(express.static(STATIC_DIR, { index: false, maxAge: '1h' }));
+  // SPA history fallback, but never for /api — a mistyped endpoint must stay a
+  // 404 rather than silently returning the app shell with a 200.
+  app.get(/^(?!\/api\/).*/, (_req, res) =>
+    res.sendFile(path.join(STATIC_DIR, 'index.html')));
+  console.log(`[http] serving failover dashboard from ${STATIC_DIR}`);
+} else {
+  app.get('/', (_req, res) =>
+    res.json({ service: 'senseable-backend', ok: true, api: '/api' }));
+}
 
 const SWEEP_MS = Number(process.env.SWEEP_MS ?? 5000);
 
@@ -74,6 +103,11 @@ async function main() {
     // happens precisely because packets stopped — so nothing else can notice it.
     checkAllPresence();
     broadcastDevices();
+    // Drain the command outbox. Cloud-authored commands arrive here as rows via
+    // the sync worker's downward pass, never as MQTT, so something on the edge
+    // has to put them on a broker. Riding the existing sweep keeps it to one
+    // timer and means a command is never more than SWEEP_MS from the wire.
+    dispatchPendingCommands();
   }, SWEEP_MS).unref();
 
   const server = app.listen(PORT, () => {

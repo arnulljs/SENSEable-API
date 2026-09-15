@@ -24,6 +24,7 @@ import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './inges
 import { fitLinear } from './calibration.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand, getMqttStats } from './mqtt.js';
+import { markPublished, getDispatchStats } from './dispatch.js';
 import { broadcastDevices, getRealtimeStats } from './realtime.js';
 import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } from './security.js';
 import { getPresenceStats } from './presence.js';
@@ -235,6 +236,10 @@ router.patch('/devices/:deviceId/modules/:moduleId/ports/:portId/enabled',
           { chip, ch: port.channel });
         const rec = await recordCommand(dev, envelope);
         const published = publishCommand(cmdTopic(mqttTid, dev.nodeId), envelope);
+        // Stamp it so the outbox dispatcher does not send it a second time.
+        // Leaving it unstamped is harmless but wasteful: the node would receive
+        // the same envelope twice, once now and once on the next sweep.
+        if (published) markPublished(envelope.cid);
         command = { cid: envelope.cid, published, action: envelope.action, id: rec?.id ?? null };
       }
     } catch (e) {
@@ -340,6 +345,7 @@ router.post('/commands', wrap(async (req, res) => {
 
   const topic = cmdTopic(tid, dev.nodeId);
   const published = publishCommand(topic, envelope);
+  if (published) markPublished(envelope.cid);
 
   res.status(201).json({
     ok: true,
@@ -392,6 +398,7 @@ router.get('/health', (_req, res) => {
   const security = getSecurityEvents();
   const presence = getPresenceStats();
   const reconcile = getReconcileStats();
+  const dispatch = getDispatchStats();
   const freshest = store.devices.reduce(
     (acc, d) => (d.lastSeen && d.lastSeen > acc ? d.lastSeen : acc), 0);
 
@@ -417,6 +424,13 @@ router.get('/health', (_req, res) => {
     // of it we corrected. Non-zero `drifted` with zero `corrected` means the
     // node isn't accepting sensor_port commands.
     reconcile,
+    // Command outbox drain. Non-zero `expired` means commands authored in the
+    // cloud aged out before any broker was reachable, which is the downlink's
+    // version of a dropped packet.
+    dispatch,
+    // The tier answering this request. src/api.js uses it to label the
+    // dashboard's connection chip without having to guess from the URL.
+    tier: 'edge',
     now: new Date().toISOString(),
   });
 });

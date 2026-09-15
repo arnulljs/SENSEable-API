@@ -75,8 +75,12 @@ export async function ensureDevice(tid, nid) {
 
     const row = await withTenant(tenant.id, async (c) => {
       const { rows } = await c.query(
-        `INSERT INTO devices (tenant_id, node_id, name, status, first_seen, last_seen)
-         VALUES ($1, $2, $3, 'online', now(), now())
+        // device_id is DERIVED, not random (migration 009). Under cloud-first
+        // either tier can be the first to meet a node, and two random uuids for
+        // the same physical device would collide on UNIQUE (tenant_id, node_id)
+        // the first time sync.js tried to replicate it.
+        `INSERT INTO devices (device_id, tenant_id, node_id, name, status, first_seen, last_seen)
+         VALUES (senseable_uuid('device', $1::text, $2), $1::uuid, $2, $3, 'online', now(), now())
          ON CONFLICT (tenant_id, node_id) DO UPDATE SET last_seen = now()
          RETURNING device_id, node_id, name, status, comm_mode,
                    uptime_s, rssi, free_heap, configured`,
@@ -120,9 +124,9 @@ async function provisionActuators(tenantUuid, dev) {
     const out = [];
     for (let n = 1; n <= ACTUATOR_COUNT; n += 1) {
       const { rows: r } = await c.query(
-        `INSERT INTO actuators (device_id, tenant_id, actuator_code, name, port,
+        `INSERT INTO actuators (actuator_id, device_id, tenant_id, actuator_code, name, port,
                                 channel, mode, state, duty, dur, last_ack)
-         VALUES ($1, $2, $3, $4, $5, $6, 'bin', 0, 0, 0, 'pending')
+         VALUES (senseable_uuid('actuator', $1::text, $5), $1::uuid, $2::uuid, $3, $4, $5, $6, 'bin', 0, 0, 0, 'pending')
          ON CONFLICT (device_id, port) DO NOTHING
          RETURNING actuator_code, name, port, channel, gpio, mode,
                    state, duty, dur, last_ack, updated_at`,
@@ -154,9 +158,9 @@ export async function ensureModule(dev, addr) {
 
     const row = await withTenant(dev._tenantUuid, async (c) => {
       const { rows } = await c.query(
-        `INSERT INTO modules (device_id, tenant_id, i2c_address, name,
+        `INSERT INTO modules (module_id, device_id, tenant_id, i2c_address, name,
                               first_seen, last_seen)
-         VALUES ($1, $2, $3, $4, now(), now())
+         VALUES (senseable_uuid('module', $1::text, $3), $1::uuid, $2::uuid, $3, $4, now(), now())
          ON CONFLICT (device_id, i2c_address) DO UPDATE SET last_seen = now()
          RETURNING module_id, i2c_address, name, configured`,
         [dev._uuid, dev._tenantUuid, norm, `Expansion Board ${norm}`]);
@@ -197,9 +201,9 @@ export async function ensurePort(dev, mod, channel) {
       // Descriptive columns are omitted deliberately so the migration-006
       // defaults apply: identity calibration, `raw` units, full ADS1115 span.
       const { rows } = await c.query(
-        `INSERT INTO ports (module_id, tenant_id, port_code, port_index,
+        `INSERT INTO ports (port_id, module_id, tenant_id, port_code, port_index,
                             active_flag, first_seen, last_seen)
-         VALUES ($1, $2, $3, $4, true, now(), now())
+         VALUES (senseable_uuid('port', $1::text, $3), $1::uuid, $2::uuid, $3, $4, true, now(), now())
          ON CONFLICT (module_id, port_code) DO UPDATE SET last_seen = now()
          RETURNING port_id, port_code, port_index, label, unit,
                    range_min, range_max, safe_min, safe_max,

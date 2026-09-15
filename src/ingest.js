@@ -62,9 +62,29 @@ async function resolvePacketNode(pkt) {
   return { node: null, scoped: false, error: `node '${pkt.nid}' not registered to tid '${pkt.tid}'` };
 }
 
+// Sample instant. The frozen tlm schema carries no timestamp today, so this
+// falls back to ingest time — but ingest time differs between the cloud path and
+// the failover path, and (port_id, ts) is the key reconciliation dedupes on. A
+// device-supplied `ts` (epoch ms or ISO-8601) is honoured the moment the
+// firmware starts sending one, and until then a sample ingested by both tiers
+// can appear twice. See docs/CLOUD-FIRST.md.
+function sampleTime(pkt) {
+  const raw = pkt?.ts;
+  if (raw == null) return new Date();
+  const d = typeof raw === 'number' ? new Date(raw < 1e12 ? raw * 1000 : raw) : new Date(raw);
+  return Number.isNaN(d.getTime()) ? new Date() : d;
+}
+
 // --- Telemetry ('tlm') ------------------------------------------------------
-export async function ingestTelemetry(pkt) {
+/**
+ * @param opts.origin 'cloud' (packet came over the cloud broker — the normal
+ *   cloud-first path) or 'local' (came over the local broker during failover,
+ *   so this tier is the only holder and owes the row upward).
+ */
+export async function ingestTelemetry(pkt, opts = {}) {
   if (!pkt || pkt.t !== 'tlm') return { ok: false, error: 'not a telemetry packet' };
+  const origin = opts.origin === 'local' ? 'local' : 'cloud';
+  const ts = sampleTime(pkt);
 
   const { node, scoped, error } = await resolvePacketNode(pkt);
   if (error) return { ok: false, error };
@@ -126,7 +146,7 @@ export async function ingestTelemetry(pkt) {
         lastSeen: port.lastSeen, now,
       });
 
-      pushHistory(port, port.value, port.status);   // → INSERT INTO readings
+      pushHistory(port, port.value, port.status, { origin, ts }); // → INSERT INTO readings
       matched++;
     }
   }
