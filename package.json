@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Barebones backend for SENSEable — ingests raw ADC telemetry (frozen wire protocol), applies calibration, serves the React dashboard's data shape over REST.",
+  "description": "Barebones backend for SENSEable \u2014 ingests raw ADC telemetry (frozen wire protocol), applies calibration, serves the React dashboard's data shape over REST.",
   "engines": {
     "node": ">=18"
   },
@@ -16,11 +16,14 @@
     "sync:once": "node scripts/sync.js --once",
     "sync:status": "node scripts/sync.js --status",
     "sync:backfill": "node scripts/sync.js --backfill",
-    "migrate:cloud": "node-pg-migrate -m db/migrations --envPath .env.cloud --database-url-var CLOUD_DATABASE_URL_OWNER_SESSION",
+    "migrate:cloud": "node-pg-migrate -m db/migrations --envPath .env.cloud --database-url-var CLOUD_DATABASE_URL_OWNER",
     "migrate": "node-pg-migrate -m db/migrations --envPath .env --database-url-var DATABASE_URL_OWNER",
     "test:realtime": "node scripts/test-realtime.js",
     "test:cloudfirst": "bash scripts/run-cloudfirst-tests.sh",
-    "test:dispatch": "node scripts/test-dispatch.js"
+    "test:dispatch": "node scripts/test-dispatch.js",
+    "test:replay": "node scripts/test-replay.js",
+    "simulate:cloud": "node scripts/simulate.js --mqtt --seconds 30",
+    "simulate:local": "node scripts/simulate.js --local --seconds 30"
   },
   "dependencies": {
     "cors": "^2.8.5",

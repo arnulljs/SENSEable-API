@@ -325,7 +325,15 @@ async function syncQueue(table, meta, q) {
     // Push FIRST, mark second. If the push throws, nothing is marked and the
     // same rows are retried next pass — the backlog is never lost to a
     // half-finished transfer.
-    await push(table, rows, meta, 'queue', { omit: q.omit, conflict: q.conflict });
+    // synced is per-tier bookkeeping, not data. Copying the edge's `false`
+    // upward marks rows in the DESTINATION as still owed to the cloud, which is
+    // nonsense — the cloud IS the cloud. Nothing drains them there, so it was
+    // harmless, but it made the cloud report a permanent phantom backlog and
+    // hid the one case that genuinely matters: a tier running without
+    // TIER=cloud.
+    await push(table, rows, meta, 'queue', {
+      omit: q.omit, conflict: q.conflict, override: { synced: true },
+    });
 
     if (!DRY) {
       await localPool.query(
@@ -409,7 +417,14 @@ async function syncStatic(table, meta, dir = {}) {
 // Configuration comes down for a second reason: the dashboard writes to the
 // cloud now, and the edge needs calibration, safe ranges and inventory LOCALLY
 // or it cannot convert raw ADC counts during the next outage.
+// In bridge mode the edge is the SOURCE of cloud telemetry, not a mirror of it,
+// so pulling readings back down only re-fetches rows it pushed moments earlier
+// to have every one bounce off the unique index. Configuration still comes down;
+// only the telemetry pull is skipped.
+const BRIDGE_MODE = process.env.EDGE_BRIDGES_CLOUD === 'true';
+
 async function pullQueue(table, meta, q) {
+  if (BRIDGE_MODE && table === 'readings') return 0;
   // Same problem in the other direction: the edge assigns ids for rows it pulls
   // down, and its sequence is just as likely to be behind.
   await alignSequence(localPool, table, q.id);

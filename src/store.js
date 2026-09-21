@@ -361,40 +361,75 @@ export function findPortByChannel(node, moduleAddress, channelIndex) {
  *   'local' when it arrived over the LOCAL broker during failover, which means
  *   this row is the only copy in existence and the cloud is owed it.
  * @param opts.ts  device-supplied sample instant. Falls back to ingest time.
+ * @param opts.raw  the raw ADC count for THIS sample. Required for a replayed
+ *   packet, which deliberately does not write port.raw — without it the stored
+ *   row would carry the live raw count instead of the buffered one.
+ * @param opts.replay  true for a sample the node buffered during an outage and
+ *   is only now pushing. It is persisted, but kept out of the in-memory ring and
+ *   out of ports.last_value — a three-hour-old reading must not become the
+ *   number on the gauge, and appending it to the ring would put the live chart
+ *   out of order.
  */
 export function pushHistory(port, value, status, opts = {}) {
   const at = opts.ts instanceof Date ? opts.ts : new Date();
-  port.history.push({ timestamp: fmtTs(at), value, status });
-  if (port.history.length > HISTORY_CAP) {
-    port.history.splice(0, port.history.length - HISTORY_CAP);
+
+  if (!opts.replay) {
+    port.history.push({ timestamp: fmtTs(at), value, status });
+    if (port.history.length > HISTORY_CAP) {
+      port.history.splice(0, port.history.length - HISTORY_CAP);
+    }
   }
-  persistReading(port, value, status, at, opts.origin ?? 'cloud').catch((e) =>
-    console.error('[store] persist reading failed:', e.message)
-  );
+
+  persistReading(port, value, status, at, opts.origin ?? 'cloud', opts.replay === true,
+                 opts.raw ?? port.raw ?? 0)
+    .catch((e) => console.error('[store] persist reading failed:', e.message));
 }
 
 // Which tier this process is. On the cloud tier nothing is ever "owed" upward,
 // so every row is born synced regardless of which broker delivered it.
 const IS_CLOUD_TIER = process.env.TIER === 'cloud';
 
-async function persistReading(port, value, status, at, origin) {
+// BRIDGE MODE — the interim shape of cloud-first.
+//
+// The finished topology has something subscribing to the cloud broker and
+// writing straight into Supabase. Until that exists, a packet published to the
+// cloud broker reaches this edge, gets stored as origin='cloud', synced=true,
+// and STOPS. synced=true means the sync worker will never offer it upward, so
+// the row lives on the edge forever and the cloud dashboard never sees it.
+// Correct once a bridge exists. A dead end until then.
+//
+// With EDGE_BRIDGES_CLOUD=true this server IS the bridge: cloud-origin rows are
+// marked unsynced so the sync worker carries them to Supabase. The path becomes
+// node -> cloud broker -> edge -> Supabase -> dashboard, which delivers the same
+// observable behaviour with no new infrastructure.
+//
+// Turn it OFF the day a real bridge starts writing to Supabase, or both will
+// insert the same rows. They would collide harmlessly on (port_id, ts), but
+// paying twice for every reading is not a steady state.
+const EDGE_BRIDGES_CLOUD = process.env.EDGE_BRIDGES_CLOUD === 'true';
+
+async function persistReading(port, value, status, at, origin, replay = false, raw = 0) {
   const dev = deviceOfPort(port);
   if (!dev) return;
   // A 'cloud'-origin row on the edge is a MIRROR of something the cloud already
   // holds. Marking it synced is what stops sync.js from pushing it straight back
   // up, which would be an echo loop with the ingest path.
-  const synced = IS_CLOUD_TIER || origin === 'cloud';
+  const synced = IS_CLOUD_TIER || (origin === 'cloud' && !EDGE_BRIDGES_CLOUD);
   await withTenant(dev._tenantUuid, async (c) => {
     await c.query(
       `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (port_id, ts) DO NOTHING`,
-      [port._uuid, dev._tenantUuid, at, port.raw ?? 0, value, status, origin, synced]
+      [port._uuid, dev._tenantUuid, at, raw, value, status, origin, synced]
     );
-    await c.query(
-      `UPDATE ports SET last_value=$2, last_status=$3 WHERE port_id=$1`,
-      [port._uuid, value, status]
-    );
+    // A replayed sample is history. Letting it write last_value would make the
+    // dashboard show an outage-era reading as the current one.
+    if (!replay) {
+      await c.query(
+        `UPDATE ports SET last_value=$2, last_status=$3 WHERE port_id=$1`,
+        [port._uuid, value, status]
+      );
+    }
   });
 }
 

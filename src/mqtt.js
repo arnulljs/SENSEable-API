@@ -168,6 +168,12 @@ async function route(broker, topic, buf) {
   }
   stats.accepted += 1;
 
+  // A FIFO replay burst is dozens of packets in a few seconds, none of which
+  // changes anything a viewer is looking at. Skipping the presence sweep and the
+  // broadcast keeps the dashboard from being hammered with identical updates
+  // while history backfills.
+  if (result?.replay) return;
+
   // Check presence on the ingest path too, not only on the sweep. Recovery is
   // the case that matters: a node coming back is known the instant its first
   // packet lands. Going offline still comes from the sweep, since absence has no

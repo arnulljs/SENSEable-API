@@ -20,6 +20,10 @@ EDGE_APP="postgres://senseable_app:app@127.0.0.1:5432/senseable"
 CLOUD_OWNER="postgres://senseable_owner:admin@127.0.0.1:5432/senseable_cloud"
 CLOUD_APP="postgres://senseable_app:app@127.0.0.1:5432/senseable_cloud"
 
+# Bridge mode deliberately disables the readings pull-down (the edge is the
+# SOURCE of cloud telemetry there, not a mirror of it), so the mirror assertions
+# below expect different numbers.
+BRIDGE="${EDGE_BRIDGES_CLOUD:-false}"
 pass=0; fail=0
 # SQL is passed through a file, never re-quoted into another shell, so a literal
 # $$ or ' inside a query cannot be mangled by an intermediate expansion.
@@ -75,7 +79,11 @@ is "no table failed"                   "$(echo "$OUT" | grep -c FAILED)" "0"
 is "cloud now holds both streams"      "$(q senseable_cloud 'select count(*) from readings')" "24"
 is "backlog fully drained"             "$(q senseable 'select count(*) from readings where not synced')" "0"
 is "failover rows survived the merge"  "$(q senseable_cloud "select count(*) from readings where origin = 'local'")" "12"
-is "edge mirrored the cloud stream"    "$(q senseable 'select count(*) from readings')" "24"
+if [ "$BRIDGE" = "true" ]; then
+  is "bridge mode: no mirror pulled back" "$(q senseable 'select count(*) from readings')" "12"
+else
+  is "edge mirrored the cloud stream"    "$(q senseable 'select count(*) from readings')" "24"
+fi
 
 echo
 echo "=== 5. idempotency: a second pass must move nothing ==="
@@ -83,7 +91,9 @@ OUT2=$(npm run sync:once 2>&1)
 MOVED=$(echo "$OUT2" | grep -oE '[0-9]+ row\(s\) replicated' | grep -oE '^[0-9]+')
 is "second pass replicates 0 rows"     "${MOVED:-x}" "0"
 is "no row duplication on cloud"       "$(q senseable_cloud 'select count(*) from readings')" "24"
-is "no row duplication on edge"        "$(q senseable 'select count(*) from readings')" "24"
+if [ "$BRIDGE" != "true" ]; then
+  is "no row duplication on edge"      "$(q senseable 'select count(*) from readings')" "24"
+fi
 
 echo
 echo "=== 6. mirror gap: cloud keeps ingesting while the edge is not listening ==="
@@ -92,7 +102,11 @@ TIER=cloud DATABASE_URL="$CLOUD_APP" DATABASE_URL_OWNER="$CLOUD_OWNER" \
   node scripts/test-cloudfirst.js >/dev/null 2>&1
 is "cloud ahead of edge"               "$(q senseable_cloud 'select count(*) from readings')" "36"
 npm run sync:once >/dev/null 2>&1
-is "edge caught up by pull-down"       "$(q senseable 'select count(*) from readings')" "36"
+if [ "$BRIDGE" = "true" ]; then
+  is "bridge mode: pull-down stays off" "$(q senseable 'select count(*) from readings')" "12"
+else
+  is "edge caught up by pull-down"     "$(q senseable 'select count(*) from readings')" "36"
+fi
 is "pulled rows are not re-queued"     "$(q senseable 'select count(*) from readings where not synced')" "0"
 
 echo
