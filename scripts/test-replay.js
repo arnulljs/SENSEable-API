@@ -16,7 +16,12 @@ const is = (n, g, w) => { const ok = String(g) === String(w);
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${n}${ok ? '' : ` (got ${g}, want ${w})`}`); ok ? pass++ : fail++; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const TID = 'tenant-123', NID = 'N-REPLAY';
+// The tid must be one tenants.mqtt_tid actually maps, or strict ingest rejects
+// every packet. Hardcoding 'tenant-123' broke the moment the bench tenant was
+// re-mapped, so it is taken from the database after hydrate() unless
+// REPLAY_TID overrides it.
+let TID = process.env.REPLAY_TID ?? null;
+const NID = 'N-REPLAY';
 const pkt = (tsSec, raw, replay) => ({
   t: 'tlm', v: 1, tid: TID, nid: NID, ts: tsSec,
   adc: [{ a: '0x48', p: [[0, raw, 0]] }],
@@ -24,6 +29,15 @@ const pkt = (tsSec, raw, replay) => ({
 });
 
 await hydrate();
+const { store } = await import('../src/store.js');
+TID ??= Object.keys(store.tenantByMqttTid)[0] ?? null;
+if (!TID || !store.tenantByMqttTid[TID]) {
+  console.error(`  no usable tid: tenants.mqtt_tid maps [${Object.keys(store.tenantByMqttTid).join(', ')}]` +
+                (process.env.REPLAY_TID ? `, REPLAY_TID='${process.env.REPLAY_TID}' is not among them` : ''));
+  await closePool();
+  process.exit(1);
+}
+console.log(`  using tid '${TID}' (tenant ${store.tenantByMqttTid[TID].slug})`);
 const nowSec = Math.floor(Date.now() / 1000);
 
 // Live sample: the tank is fine right now.
@@ -34,6 +48,11 @@ await sleep(400);
 // dashboard projection is built from.
 const portOf = () => findPortByChannel(findNodeScoped(TID, NID), '0x48', 0);
 const live = portOf();
+if (!live) {
+  console.error(`  FAIL  live sample was not ingested for ${TID}/${NID} — nothing else can be checked`);
+  await closePool();
+  process.exit(1);
+}
 is('live sample sets the current value', live.value != null, true);
 const current = live.value;
 const historyLen = live.history.length;
