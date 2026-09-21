@@ -121,6 +121,17 @@ function flush() {
  * A no-op when the socket server was never started, so ingest code can call it
  * unconditionally without caring whether realtime is enabled.
  */
+// Tenants with at least one open, subscribed dashboard socket. claim.js uses it
+// to decide which organization is "logged in right now".
+export function getActiveTenantSlugs() {
+  if (!wss) return [];
+  const out = new Set();
+  for (const ws of wss.clients) {
+    if (ws.readyState === ws.OPEN && ws.tenantSlug) out.add(ws.tenantSlug);
+  }
+  return [...out];
+}
+
 export function broadcastDevices() {
   if (!wss) return;
   if (flushTimer) { stats.coalesced += 1; return; }

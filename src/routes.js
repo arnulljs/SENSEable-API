@@ -32,6 +32,7 @@ import { broadcastDevices, getRealtimeStats } from './realtime.js';
 import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } from './security.js';
 import { getPresenceStats } from './presence.js';
 import { getReconcileStats } from './reconcile.js';
+import { noteDashboardActivity, getClaimStats } from './claim.js';
 
 export const router = Router();
 
@@ -65,6 +66,7 @@ router.use('/commands', (req, res, next) => {
 
 // --- Read models the frontend renders --------------------------------------
 router.get('/devices', (req, res) => {
+  noteDashboardActivity(tenantOf(req));   // claim.js: which org is logged in
   refreshAll();
   res.json(projectDevices(tenantOf(req)));
 });
@@ -439,6 +441,9 @@ router.get('/health', (_req, res) => {
     acceptedTids: Object.keys(store.tenantByMqttTid),
     // NODE-TENANT-OVERRIDE: nodes pinned to a tenant regardless of their tid.
     nodeOverrides: listNodeAssignments(),
+    // Claim-on-connect state: whether it is on, and which organizations count
+    // as logged in right now.
+    claim: getClaimStats(),
     newestTelemetryAgeMs: freshest ? Date.now() - freshest : null,
     mqtt,
     // Socket subscriber count and broadcast counters: "the dashboard isn't

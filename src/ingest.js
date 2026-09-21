@@ -18,6 +18,7 @@ import {
 import { derivePortStatus, deriveNodeStatus, describeConnState, STALE_MS } from './status.js';
 import { ensureDeviceForTenant, ensureModule, ensurePort, touchPresence } from './provision.js';
 import { reconcileNode, checkTopologyConsistency, staleMsFor } from './reconcile.js';
+import { claimIfFloating, announceClaim } from './claim.js';
 
 // Auto-provisioning: create inventory rows the first time real hardware
 // announces itself. Set AUTO_PROVISION=false to go back to strict declared-only
@@ -42,6 +43,11 @@ const STRICT_TENANT = process.env.INGEST_STRICT_TENANT !== 'false';
 // Both still require a KNOWN mapping, so an unmapped tid on an unpinned node is
 // rejected exactly as before.
 async function resolvePacketNode(pkt) {
+  // CLAIM_ON_CONNECT (claim.js): an unpinned board is claimed by the single
+  // organization logged in right now, and the claim becomes its pin. Returns
+  // null when the mode is off or the choice is ambiguous, leaving the normal
+  // routing below untouched.
+  const claimed = await claimIfFloating(pkt.nid);
   const pinned = pkt.nid ? store.tenantByNodeId[pkt.nid] : null;
   const tenant = pinned ?? (pkt.tid ? store.tenantByMqttTid[pkt.tid] : null);
 
@@ -55,6 +61,7 @@ async function resolvePacketNode(pkt) {
   if (!node && tenant && AUTO_PROVISION && pkt.nid) {
     node = await ensureDeviceForTenant(tenant, pkt.nid);
   }
+  if (node && claimed) announceClaim(node);
 
   if (node) {
     // Remember the tid this board really uses, so commands for a pinned node
