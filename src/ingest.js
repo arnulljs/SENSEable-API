@@ -6,16 +6,17 @@
 //   disco  usc/thesis/{tid}/{nid}/disco  per-chip port connection map
 //   ack    usc/thesis/{tid}/{nid}/ack    command lifecycle feedback (cid-keyed)
 //
-// Everything resolves the tenant from `tid` (→ tenants.mqtt_tid) BEFORE matching
-// `nid`, so a node claiming "N001" can never write into another tenant's device.
+// Everything resolves the tenant BEFORE matching `nid` — from a node_id pin if
+// one exists, otherwise from `tid` (→ tenants.mqtt_tid) — so a node claiming
+// "N001" can never write into another tenant's device.
 
 import {
-  store, findNode, findNodeScoped, findPortByChannel, pushHistory,
+  store, findNode, findPortByChannel, pushHistory,
   applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
   updateCommandStatus, setActuatorAck, addNotification,
 } from './store.js';
 import { derivePortStatus, deriveNodeStatus, describeConnState, STALE_MS } from './status.js';
-import { ensureDevice, ensureModule, ensurePort, touchPresence } from './provision.js';
+import { ensureDeviceForTenant, ensureModule, ensurePort, touchPresence } from './provision.js';
 import { reconcileNode, checkTopologyConsistency, staleMsFor } from './reconcile.js';
 
 // Auto-provisioning: create inventory rows the first time real hardware
@@ -33,24 +34,40 @@ function normAddr(a) {
 // INGEST_STRICT_TENANT=false only for a single-tenant bring-up bench.
 const STRICT_TENANT = process.env.INGEST_STRICT_TENANT !== 'false';
 
+// NODE-TENANT-OVERRIDE: tenant resolution now has two sources, first wins:
+//   1. store.tenantByNodeId — a per-node pin (node_tenant_assignments, set via
+//      /api/node-assignments). node_id is MAC-derived, so it is unique per
+//      physical board even though every board ships the same compiled tid.
+//   2. store.tenantByMqttTid — the normal tid -> tenants.mqtt_tid path.
+// Both still require a KNOWN mapping, so an unmapped tid on an unpinned node is
+// rejected exactly as before.
 async function resolvePacketNode(pkt) {
-  const scoped = findNodeScoped(pkt.tid, pkt.nid);
-  if (scoped) return { node: scoped, scoped: true, error: null };
+  const pinned = pkt.nid ? store.tenantByNodeId[pkt.nid] : null;
+  const tenant = pinned ?? (pkt.tid ? store.tenantByMqttTid[pkt.tid] : null);
 
-  const tenantKnown = pkt.tid && store.tenantByMqttTid[pkt.tid];
+  let node = tenant
+    ? store.devices.find((d) => d._tenantUuid === tenant.id && d.nodeId === pkt.nid) ?? null
+    : null;
 
   // Known tenant + unknown node ⇒ this is a node we've simply never met. Create
   // it rather than dropping its data on the floor. The tenant check above is
   // what keeps this safe: an unmapped tid can never provision anything.
-  if (tenantKnown && AUTO_PROVISION && pkt.nid) {
-    const created = await ensureDevice(pkt.tid, pkt.nid);
-    if (created) return { node: created, scoped: true, error: null };
+  if (!node && tenant && AUTO_PROVISION && pkt.nid) {
+    node = await ensureDeviceForTenant(tenant, pkt.nid);
   }
 
-  if (!tenantKnown) {
+  if (node) {
+    // Remember the tid this board really uses, so commands for a pinned node
+    // go to the topic it subscribes to rather than its new tenant's tid.
+    if (pkt.tid) node.wireTid = pkt.tid;
+    return { node, scoped: true, error: null };
+  }
+
+  if (!tenant) {
     const msg =
       `unmapped tid '${pkt.tid}' — add a row to tenants.mqtt_tid mapping it ` +
-      `to a tenant (see db/seed_hw.sql)`;
+      `to a tenant (see db/seed_hw.sql), or pin node '${pkt.nid}' with ` +
+      `POST /api/node-assignments`;
     if (STRICT_TENANT) {
       console.warn(`[ingest] REJECTED: ${msg}`);
       return { node: null, scoped: false, error: msg };
@@ -59,7 +76,12 @@ async function resolvePacketNode(pkt) {
     return { node: findNode(pkt.nid), scoped: false, error: null };
   }
 
-  return { node: null, scoped: false, error: `node '${pkt.nid}' not registered to tid '${pkt.tid}'` };
+  return {
+    node: null, scoped: false,
+    error: pinned
+      ? `node '${pkt.nid}' is pinned to tenant '${tenant.slug}' but could not be provisioned there`
+      : `node '${pkt.nid}' not registered to tid '${pkt.tid}'`,
+  };
 }
 
 // Sample instant. The frozen tlm schema carries no timestamp today, so this

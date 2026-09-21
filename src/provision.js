@@ -60,6 +60,15 @@ function once(key, fn) {
  */
 export async function ensureDevice(tid, nid) {
   const tenant = tid ? store.tenantByMqttTid[tid] : null;
+  return ensureDeviceForTenant(tenant, nid);
+}
+
+/**
+ * NODE-TENANT-OVERRIDE: the creation body of ensureDevice(), taking a tenant
+ * that has ALREADY been resolved (by tid, or by the node_id override in
+ * node_tenant_assignments). ensureDevice() above is unchanged for its callers.
+ */
+export async function ensureDeviceForTenant(tenant, nid) {
   if (!tenant || !nid) return null;
 
   const existing = store.devices.find(

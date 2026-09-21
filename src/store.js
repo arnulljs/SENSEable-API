@@ -58,6 +58,7 @@ export const deviceKey = (slug, nodeId) => `${slug}:${nodeId}`;
 export const store = {
   tenants: {},            // slug -> { id(uuid), slug, name, mqttTid }
   tenantByMqttTid: {},    // 'tenant-123' -> tenant record   (ingest tenant resolution)
+  tenantByNodeId: {},     // NODE-TENANT-OVERRIDE: node_id -> tenant record (migration 011)
   devices: [],            // hydrated device tree (frontend shape + internal uuids)
   notifications: [],
   savedFormulas: [],
@@ -83,6 +84,24 @@ export async function hydrate() {
     const rec = { id: t.tenant_id, slug: t.slug, name: t.name, mqttTid: t.mqtt_tid };
     store.tenants[t.slug] = rec;
     if (t.mqtt_tid) store.tenantByMqttTid[t.mqtt_tid] = rec;
+  }
+
+  // NODE-TENANT-OVERRIDE: per-node tenant pins (migration 011). Checked before
+  // tid resolution in ingest.js, so a physical board can be moved between
+  // tenants from the database alone. Guarded like loadCommands(): a DB that
+  // hasn't run the migration still boots, just without the feature.
+  store.tenantByNodeId = {};
+  try {
+    const { rows: pins } = await adminPool.query(
+      `SELECT a.node_id, t.slug FROM node_tenant_assignments a
+       JOIN tenants t ON t.tenant_id = a.tenant_id`);
+    for (const p of pins) {
+      if (store.tenants[p.slug]) store.tenantByNodeId[p.node_id] = store.tenants[p.slug];
+    }
+  } catch (e) {
+    if (e.code !== '42P01') throw e;
+    console.warn('[store] node_tenant_assignments missing — run migration 1730000000011; ' +
+                 'node-level tenant overrides disabled');
   }
 
   // One flat join, assembled in JS — cheaper and clearer than three round trips.
@@ -241,7 +260,8 @@ export async function hydrate() {
   store.ready = true;
   const nPorts = store.devices.reduce(
     (n, d) => n + d.modules.reduce((k, m) => k + m.ports.length, 0), 0);
-  console.log(`[store] hydrated: ${tenants.length} tenants, ${store.devices.length} devices, ${nPorts} ports`);
+  console.log(`[store] hydrated: ${tenants.length} tenants, ${store.devices.length} devices, ${nPorts} ports, ` +
+              `${Object.keys(store.tenantByNodeId).length} node overrides`);
   return store;
 }
 
@@ -756,6 +776,51 @@ function resolvePort(deviceId, moduleId, portId) {
   const d = store.devices.find((x) => x.id === deviceId);
   const m = d?.modules.find((x) => x.id === moduleId);
   return m?.ports.find((x) => x.id === portId) ?? null;
+}
+
+// ── NODE-TENANT-OVERRIDE: node tenant assignments (migration 011) ───────────
+// Cross-tenant routing metadata, so it goes through adminPool (the same reason
+// sync_state does) rather than any single tenant's RLS scope. Testing tool: it
+// is not gated by x-tenant-id and must not be exposed to Designers as a feature.
+export function listNodeAssignments() {
+  return Object.entries(store.tenantByNodeId).map(([nodeId, t]) => ({
+    nodeId, tenantSlug: t.slug, tenantName: t.name,
+  }));
+}
+
+export async function assignNodeToTenant(nodeId, tenantSlug, note = null) {
+  const nid = String(nodeId ?? '').trim();
+  if (!nid) throw Object.assign(new Error('nodeId is required'), { status: 400 });
+  const tenant = store.tenants[tenantSlug];
+  if (!tenant) throw Object.assign(new Error(`unknown tenant '${tenantSlug}'`), { status: 404 });
+
+  await adminPool.query(
+    `INSERT INTO node_tenant_assignments (node_id, tenant_id, note, assigned_at)
+     VALUES ($1, $2, $3, now())
+     ON CONFLICT (node_id) DO UPDATE
+       SET tenant_id = EXCLUDED.tenant_id, note = EXCLUDED.note, assigned_at = now()`,
+    [nid, tenant.id, note]);
+
+  store.tenantByNodeId[nid] = tenant;
+  return { nodeId: nid, tenantSlug: tenant.slug };
+}
+
+export async function clearNodeAssignment(nodeId) {
+  const nid = String(nodeId ?? '').trim();
+  if (!nid) throw Object.assign(new Error('nodeId is required'), { status: 400 });
+  await adminPool.query('DELETE FROM node_tenant_assignments WHERE node_id = $1', [nid]);
+  delete store.tenantByNodeId[nid];
+  return { nodeId: nid, cleared: true };
+}
+
+// The tid a node actually publishes and subscribes under. For an overridden
+// node this differs from its tenant's mqtt_tid, and commands must go to the
+// node's real topic or the board never sees them. Learned from the node's own
+// packets (ingest.js stamps dev.wireTid), so it is unknown until the node has
+// sent something since this process booted; until then the tenant's tid is the
+// only candidate.
+export function commandTidFor(dev) {
+  return dev.wireTid ?? store.tenants[dev.tenantId]?.mqttTid ?? null;
 }
 
 // ── Projection to the frontend shape ────────────────────────────────────────

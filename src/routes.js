@@ -10,6 +10,8 @@
 //                           is connected.
 //   GET  /commands          recent command log with latest ack status.
 //   POST /ingest/ack        broker-free ack injection (parallels telemetry).
+//   GET/POST/DELETE /node-assignments
+//                           NODE-TENANT-OVERRIDE: bench-only node -> tenant pin.
 
 import { Router } from 'express';
 import {
@@ -19,6 +21,7 @@ import {
   findNode, recordCommand, applyActuatorCommand,
   renameDevice, renameModule, renameActuator,
   removeDevice, removeModule, removePort, setPortEnabled,
+  listNodeAssignments, assignNodeToTenant, clearNodeAssignment, commandTidFor,
 } from './store.js';
 import { ingestTelemetry, ingestDiscovery, ingestAck, refreshAll } from './ingest.js';
 import { fitLinear } from './calibration.js';
@@ -226,8 +229,8 @@ router.patch('/devices/:deviceId/modules/:moduleId/ports/:portId/enabled',
     // I2C address in the fixed 0x48..0x4B range the protocol defines.
     let command = null;
     try {
-      const tenant = store.tenants[dev.tenantId];
-      const mqttTid = tenant?.mqttTid;
+      // NODE-TENANT-OVERRIDE: the node's real tid, not necessarily its tenant's.
+      const mqttTid = commandTidFor(dev);
       const chip = CHIP_ADDRS.indexOf(String(req.params.moduleId).toLowerCase());
       if (mqttTid && chip >= 0 && Number.isInteger(port.channel)) {
         const envelope = buildCommand(
@@ -305,10 +308,11 @@ router.post('/commands', wrap(async (req, res) => {
   const dev = findNode(deviceId);
   if (!dev) return res.status(404).json({ error: `unknown device '${deviceId}'` });
 
-  // Resolve the BROKER tenant string (tenant-123) from our tenant. The browser
-  // never supplies this — it only knows the slug.
-  const tenant = store.tenants[dev.tenantId];
-  const tid = tenant?.mqttTid;
+  // Resolve the BROKER tenant string (tenant-123). The browser never supplies
+  // this — it only knows the slug. NODE-TENANT-OVERRIDE: commandTidFor()
+  // prefers the tid the node itself publishes with, so a node pinned to a
+  // different tenant still receives its commands.
+  const tid = commandTidFor(dev);
   if (!tid) {
     return res.status(409).json({
       error: `tenant '${dev.tenantId}' has no mqtt_tid mapping — set tenants.mqtt_tid (see db/seed_hw.sql)`,
@@ -387,6 +391,28 @@ router.post('/ingest/ack', wrap(async (req, res) => {
   res.status(result.ok ? 200 : 400).json(result);
 }));
 
+// --- NODE-TENANT-OVERRIDE: node tenant pins (bench testing only) -----------
+// Cross-tenant by nature, so NOT scoped by x-tenant-id. Anyone who can reach
+// this API can move any node into any tenant, which is fine for a single-team
+// bench and is exactly why this is a testing tool, not a Designer feature.
+router.get('/node-assignments', (_req, res) => res.json(listNodeAssignments()));
+
+router.post('/node-assignments', wrap(async (req, res) => {
+  const { nodeId, tenantSlug, note } = req.body ?? {};
+  if (!nodeId || !tenantSlug) {
+    return res.status(400).json({ error: 'nodeId and tenantSlug are required' });
+  }
+  try {
+    res.json({ ok: true, ...(await assignNodeToTenant(nodeId, tenantSlug, note ?? null)) });
+  } catch (e) {
+    res.status(e.status ?? 400).json({ error: e.message });
+  }
+}));
+
+router.delete('/node-assignments/:nodeId', wrap(async (req, res) => {
+  res.json({ ok: true, ...(await clearNodeAssignment(req.params.nodeId)) });
+}));
+
 // --- Ops --------------------------------------------------------------------
 router.get('/health', (_req, res) => {
   // MQTT state is included because "the dashboard is frozen" has two very
@@ -411,6 +437,8 @@ router.get('/health', (_req, res) => {
     // Which tids ingest will accept. If the node's tid isn't here, every packet
     // is rejected and the dashboard freezes with no other clue.
     acceptedTids: Object.keys(store.tenantByMqttTid),
+    // NODE-TENANT-OVERRIDE: nodes pinned to a tenant regardless of their tid.
+    nodeOverrides: listNodeAssignments(),
     newestTelemetryAgeMs: freshest ? Date.now() - freshest : null,
     mqtt,
     // Socket subscriber count and broadcast counters: "the dashboard isn't
