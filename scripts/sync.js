@@ -461,10 +461,72 @@ async function pullQueue(table, meta, q) {
 }
 
 // ── One full pass ───────────────────────────────────────────────────────────
+// ── Deletions (migration 012) ───────────────────────────────────────────────
+// Upserts cannot express "this row is gone", so edge-side deletes are recorded
+// as tombstones by a trigger and applied here as cloud DELETEs. Runs BEFORE the
+// upsert pass, and skips any tombstone whose row exists again locally: ids are
+// deterministic, so a node removed and then re-provisioned comes back with the
+// same device_id, and deleting it in the cloud would erase the live row.
+const DELETABLE = new Set(['devices', 'modules', 'ports', 'actuators']);
+
+async function syncDeletions() {
+  let rows;
+  try {
+    ({ rows } = await localPool.query(
+      'SELECT id, table_name, pk_col, pk FROM sync_deletions ORDER BY id LIMIT $1', [BATCH]));
+  } catch (err) {
+    if (err.code === '42P01') return 0;   // migration 012 not applied on this edge yet
+    throw err;
+  }
+  if (!rows.length) return 0;
+
+  let applied = 0;
+  const done = [];
+  for (const r of rows) {
+    // Identifiers are interpolated, so accept only the four known tables and a
+    // plain column name — never whatever happens to be in the row.
+    if (!DELETABLE.has(r.table_name) || !/^[a-z_]+$/.test(r.pk_col)) { done.push(r.id); continue; }
+
+    const { rows: back } = await localPool.query(
+      `SELECT 1 FROM "${r.table_name}" WHERE "${r.pk_col}" = $1`, [r.pk]);
+    if (back.length) { done.push(r.id); continue; }
+
+    if (!DRY) {
+      const c = await cloudPool.connect();
+      try {
+        await c.query('BEGIN');
+        await c.query("SET LOCAL app.sync_replay = 'on'");   // don't tombstone in the cloud
+        const res = await c.query(`DELETE FROM "${r.table_name}" WHERE "${r.pk_col}" = $1`, [r.pk]);
+        await c.query('COMMIT');
+        applied += res.rowCount ?? 0;
+      } catch (err) {
+        await c.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        c.release();
+      }
+    }
+    done.push(r.id);
+  }
+  if (!DRY && done.length) {
+    await localPool.query('DELETE FROM sync_deletions WHERE id = ANY($1::bigint[])', [done]);
+  }
+  return applied;
+}
+
 async function runOnce() {
   const started = Date.now();
   let moved = 0;
   const failures = [];
+
+  try {
+    const d = await syncDeletions();
+    moved += d;
+    if (d) log(`  ↑ deletions: ${d} row(s)${DRY ? ' (dry-run)' : ''}`);
+  } catch (err) {
+    failures.push(`deletions: ${err.message}`);
+    log(`  deletions: FAILED — ${err.message}`);
+  }
 
   // ── UP: failover backlog and anything still authored on the edge ──────────
   for (const { name, strategy, queue } of TABLES) {
