@@ -90,11 +90,36 @@ async function resolvePacketNode(pkt) {
 // device-supplied `ts` (epoch ms or ISO-8601) is honoured the moment the
 // firmware starts sending one, and until then a sample ingested by both tiers
 // can appear twice. See docs/CLOUD-FIRST.md.
+//
+// PLAUSIBILITY. The firmware stamps `ts` from a DS3231 RTC, falling back to
+// time(NULL). A board whose RTC was never set reports a clock that starts at the
+// 1970 epoch (or garbage from an unpowered RTC), and trusting it would file every
+// reading decades in the past, where no chart looks and where (port_id, ts)
+// dedupe stops meaning anything. A device clock is therefore only honoured when
+// it lands in a believable window; otherwise the sample is marked `untrusted`
+// and the caller decides what to do with it.
+const TS_FLOOR_MS = Date.UTC(2024, 0, 1);
+const TS_FUTURE_SLACK_MS = 10 * 60_000;
+
 function sampleTime(pkt) {
   const raw = pkt?.ts;
-  if (raw == null) return new Date();
+  if (raw == null) return { at: new Date(), trusted: false, supplied: false };
   const d = typeof raw === 'number' ? new Date(raw < 1e12 ? raw * 1000 : raw) : new Date(raw);
-  return Number.isNaN(d.getTime()) ? new Date() : d;
+  const ms = d.getTime();
+  if (Number.isNaN(ms) || ms < TS_FLOOR_MS || ms > Date.now() + TS_FUTURE_SLACK_MS) {
+    return { at: new Date(), trusted: false, supplied: true };
+  }
+  return { at: d, trusted: true, supplied: true };
+}
+
+// Logged once per node, so a board with an unset RTC produces one warning
+// rather than one every ten seconds.
+const warnedClock = new Set();
+function warnClockOnce(nid, raw) {
+  if (warnedClock.has(nid)) return;
+  warnedClock.add(nid);
+  console.warn(`[ingest] ${nid}: device ts=${raw} is not a believable time — its RTC is ` +
+               'probably unset. Live samples use server time; replayed samples are dropped.');
 }
 
 // --- Telemetry ('tlm') ------------------------------------------------------
@@ -106,11 +131,27 @@ function sampleTime(pkt) {
 export async function ingestTelemetry(pkt, opts = {}) {
   if (!pkt || pkt.t !== 'tlm') return { ok: false, error: 'not a telemetry packet' };
   const origin = opts.origin === 'local' ? 'local' : 'cloud';
-  const ts = sampleTime(pkt);
+  const clock = sampleTime(pkt);
+  const ts = clock.at;
+
+  // FIFO REPLAY. After a WAN outage the firmware pushes its LittleFS spool,
+  // each sample tagged "r":1 (backlog_replay_task). Those readings are real and
+  // belong in the time series — but they are HISTORY, not the state of the tank.
+  // They are persisted at their own timestamps and nothing else: no gauge value,
+  // no status, no live history ring, no presence. Otherwise a replay walks the
+  // dashboard through the outage, showing old values as current and raising
+  // alerts for conditions that already resolved. scripts/test-replay.js is the
+  // contract for this branch, and mqtt.js skips its presence/broadcast pass
+  // when the result carries `replay: true`.
+  const replay = pkt.r === 1 || pkt.r === true;
+
+  if (clock.supplied && !clock.trusted) warnClockOnce(pkt.nid, pkt.ts);
 
   const { node, scoped, error } = await resolvePacketNode(pkt);
   if (error) return { ok: false, error };
   if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
+
+  if (replay) return ingestReplay(node, pkt, { origin, clock, scoped });
 
   const now = Date.now();
   node.lastSeen = now;
@@ -178,6 +219,45 @@ export async function ingestTelemetry(pkt, opts = {}) {
     console.error('[ingest] persist device state failed:', e.message));
 
   return { ok: true, node: node.id, tenantScoped: scoped, matched, unmatched, provisioned, skipped };
+}
+
+// Persist one buffered sample per channel, touching no live state. A replayed
+// sample without a believable device timestamp cannot be placed on the timeline
+// at all (stamping it "now" would put outage-era data on top of the present and
+// collide with the live sample on (port_id, ts)), so it is dropped and counted.
+async function ingestReplay(node, pkt, { origin, clock, scoped }) {
+  let stored = 0, unmatched = 0, provisioned = 0, skipped = 0, undatable = 0;
+
+  for (const module of pkt.adc ?? []) {
+    const addr = normAddr(module.a);
+    let mod = node.modules.find((m) => m.address?.toLowerCase() === addr);
+    if (!mod && AUTO_PROVISION) { mod = await ensureModule(node, addr); if (mod) provisioned++; }
+    if (!mod) { unmatched += (module.p ?? []).length; continue; }
+
+    for (const [channel, raw, code] of module.p ?? []) {
+      let port = mod.ports.find((p) => p.channel === Number(channel));
+      if (!port && AUTO_PROVISION) { port = await ensurePort(node, mod, channel); if (port) provisioned++; }
+      if (!port) { unmatched++; continue; }
+      if (port.enabled === false) { skipped++; continue; }
+      if (!clock.trusted) { undatable++; continue; }
+
+      const value = applyCalibration(raw, port.calibration);
+      // Judged as of its own moment, so a buffered sample is not filed as
+      // Offline merely for being old.
+      const status = derivePortStatus({
+        code: code ?? 0, value,
+        safeMin: port.safeMin, safeMax: port.safeMax,
+        lastSeen: clock.at.getTime(), now: clock.at.getTime(),
+      });
+      pushHistory(port, value, status, { origin, ts: clock.at, replay: true, raw });
+      stored++;
+    }
+  }
+
+  return {
+    ok: true, replay: true, node: node.id, tenantScoped: scoped,
+    stored, unmatched, provisioned, skipped, undatable,
+  };
 }
 
 // --- Discovery ('disco') ----------------------------------------------------

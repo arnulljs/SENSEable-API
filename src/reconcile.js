@@ -47,7 +47,7 @@
 // discovery repeats; a correction lost to a dropped broker connection is simply
 // re-derived from the next discovery packet.
 
-import { store, recordCommand } from './store.js';
+import { recordCommand, commandTidFor } from './store.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand } from './mqtt.js';
 
@@ -145,9 +145,12 @@ export async function reconcileNode(node, pkt) {
 }
 
 async function reissue(node, mod, channel, enable) {
-  const tenant = store.tenants[node.tenantId];
-  const mqttTid = tenant?.mqttTid;
-  if (!mqttTid) throw new Error('tenant has no mqtt_tid');
+  // The tid the node itself publishes with, which differs from its tenant's
+  // mqtt_tid when the node is pinned (node_tenant_assignments). Using the
+  // tenant's tid sent every correction for a pinned node to a topic the board
+  // does not subscribe to — or failed outright for a tenant with no mqtt_tid.
+  const mqttTid = commandTidFor(node);
+  if (!mqttTid) throw new Error('no tid known for this node');
 
   const chip = CHIP_ADDRS.indexOf(String(mod.address).toLowerCase());
   if (chip < 0) throw new Error(`address ${mod.address} outside the 0x48..0x4B range`);

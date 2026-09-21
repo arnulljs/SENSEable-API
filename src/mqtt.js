@@ -65,6 +65,9 @@ function blankStats(url, origin) {
     closes: 0,
     lastError: null,
     received: { tlm: 0, disco: 0, ack: 0, other: 0 },
+    // Retained replays the broker handed us on subscribe. Counted, never
+    // ingested — see route().
+    retained: { tlm: 0, disco: 0, ack: 0, other: 0 },
     accepted: 0,
     rejected: 0,
     lastPacketAt: null,
@@ -133,7 +136,11 @@ export function publishCommand(topic, payloadObj, { qos = 1 } = {}) {
 // Ingest is async (it may provision new hardware on first sight), so this awaits
 // rather than fire-and-forgetting — otherwise a burst of packets from an unknown
 // node could each try to create it before the first insert lands.
-async function route(broker, topic, buf) {
+// Topics whose retained replay has already been logged once, so a restart prints
+// one line per node rather than one per packet.
+const retainedLogged = new Set();
+
+async function route(broker, topic, buf, retained = false) {
   const { stats, origin, name } = broker;
   let pkt;
   try { pkt = JSON.parse(buf.toString()); }
@@ -141,8 +148,29 @@ async function route(broker, topic, buf) {
 
   // Prefer the packet's own type; fall back to the topic suffix.
   const kind = pkt.t ?? topic.split('/').pop();
+  const bucket = kind === 'tlm' || kind === 'disco' || kind === 'ack' ? kind : 'other';
+
+  // RETAINED MESSAGES ARE NOT PRESENCE.
+  // The firmware publishes discovery with retain=1, so the broker keeps the last
+  // one and replays it to every new subscriber. Ingesting that replay marked the
+  // node as just seen on every backend restart: a board that died an hour ago
+  // showed Connected for one staleness window, then flipped Offline — and a
+  // device an operator had deleted was re-provisioned from the replay. A
+  // retained packet is, by definition, not evidence the node is alive now; the
+  // node republishes discovery live on every (re)connect anyway. It is also kept
+  // out of lastPacketAt, which publishCommand() and the observed route use to
+  // decide which broker the node is on.
+  if (retained) {
+    stats.retained[bucket] += 1;
+    if (!retainedLogged.has(topic)) {
+      retainedLogged.add(topic);
+      console.log(`[mqtt:${name}] ignored retained ${kind} on ${topic} (replayed by broker, not live)`);
+    }
+    return;
+  }
+
   stats.lastPacketAt = Date.now();
-  stats.received[kind === 'tlm' || kind === 'disco' || kind === 'ack' ? kind : 'other'] += 1;
+  stats.received[bucket] += 1;
 
   let result;
   try {
@@ -282,7 +310,9 @@ async function connectBroker({ name, url, origin }) {
     });
   });
 
-  client.on('message', (topic, buf) => route(broker, topic, buf));
+  // MQTT.js passes the raw packet third; `retain` is set on messages the broker
+  // is replaying from its retained store rather than forwarding live.
+  client.on('message', (topic, buf, packet) => route(broker, topic, buf, packet?.retain === true));
 
   client.on('error', (e) => {
     stats.lastError = e.message;

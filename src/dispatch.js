@@ -25,6 +25,7 @@
 import { adminPool } from '../db/pool.js';
 import { publishCommand } from './mqtt.js';
 import { cmdTopic } from './commands.js';
+import { store, commandTidFor } from './store.js';
 
 // A command that has been sitting in the outbox for longer than this is not
 // dispatched. An actuator instruction authored an hour ago and delivered now is
@@ -49,7 +50,7 @@ export async function dispatchPendingCommands() {
   try {
     const { rows } = await adminPool.query(
       `SELECT c.command_id, c.cid, c.payload, c.created_at,
-              d.node_id, t.mqtt_tid
+              d.device_id, d.node_id, t.mqtt_tid
          FROM commands c
          JOIN devices d ON d.device_id = c.device_id
          JOIN tenants t ON t.tenant_id = c.tenant_id
@@ -65,12 +66,18 @@ export async function dispatchPendingCommands() {
       const age = Date.now() - new Date(row.created_at).getTime();
       if (age > MAX_AGE_MS) { expired.push(row.command_id); continue; }
 
-      // A tenant with no mqtt_tid cannot be addressed on the wire at all. Treat
-      // it as expired rather than retrying forever — the fix is a database row,
-      // not another delivery attempt.
-      if (!row.mqtt_tid) { expired.push(row.command_id); continue; }
+      // Address the node on the tid it actually uses. For a pinned node that is
+      // learned from its own packets (dev.wireTid) and differs from the
+      // tenant's mqtt_tid; for everything else the two are the same.
+      const dev = store.devices.find((d) => d._uuid === row.device_id);
+      const tid = (dev && commandTidFor(dev)) ?? row.mqtt_tid;
 
-      const topic = cmdTopic(row.mqtt_tid, row.node_id);
+      // A node with no known tid cannot be addressed on the wire at all. Treat
+      // it as expired rather than retrying forever — the fix is a database row
+      // (or the node reporting in), not another delivery attempt.
+      if (!tid) { expired.push(row.command_id); continue; }
+
+      const topic = cmdTopic(tid, row.node_id);
       // The stored payload IS the frozen-schema envelope, written once by
       // whichever tier accepted the command. Publishing it verbatim keeps a
       // single construction site for the wire format.

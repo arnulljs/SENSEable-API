@@ -802,7 +802,28 @@ export async function assignNodeToTenant(nodeId, tenantSlug, note = null) {
     [nid, tenant.id, note]);
 
   store.tenantByNodeId[nid] = tenant;
-  return { nodeId: nid, tenantSlug: tenant.slug };
+  const retired = retireRowsElsewhere(nid, tenant.id);
+  return { nodeId: nid, tenantSlug: tenant.slug, retired };
+}
+
+// After a node moves, the row it left behind was heard from seconds ago and
+// would keep reading Connected for a full staleness window — two tenants
+// appearing to own one physical board. Clearing its presence in memory makes it
+// read Offline on the next sweep (raising the ordinary "went offline" notice in
+// the tenant that lost it) and makes it deletable immediately. Nothing is
+// deleted: its configuration stays, in case the node is moved back.
+function retireRowsElsewhere(nid, keepTenantUuid) {
+  const retired = [];
+  for (const d of store.devices) {
+    if (d.nodeId !== nid || d._tenantUuid === keepTenantUuid) continue;
+    d.lastSeen = null;
+    for (const m of d.modules) {
+      m.lastSeen = null;
+      for (const p of m.ports) p.lastSeen = null;
+    }
+    retired.push(d.id);
+  }
+  return retired;
 }
 
 export async function clearNodeAssignment(nodeId) {
@@ -810,7 +831,15 @@ export async function clearNodeAssignment(nodeId) {
   if (!nid) throw Object.assign(new Error('nodeId is required'), { status: 400 });
   await adminPool.query('DELETE FROM node_tenant_assignments WHERE node_id = $1', [nid]);
   delete store.tenantByNodeId[nid];
-  return { nodeId: nid, cleared: true };
+
+  // The node falls back to whatever tenant its own tid maps to. Retire the row
+  // in every OTHER tenant, for the same reason as on assignment. The tid is
+  // taken from the node's own packets; if it hasn't reported since boot there
+  // is nothing live to retire from.
+  const wire = store.devices.find((d) => d.nodeId === nid && d.wireTid)?.wireTid;
+  const home = wire ? store.tenantByMqttTid[wire] : null;
+  const retired = home ? retireRowsElsewhere(nid, home.id) : [];
+  return { nodeId: nid, cleared: true, retired };
 }
 
 // The tid a node actually publishes and subscribes under. For an overridden
