@@ -960,7 +960,23 @@ export async function removeDevice(dev) {
     c.query('DELETE FROM devices WHERE device_id = $1', [dev._uuid]));
   const i = store.devices.indexOf(dev);
   if (i >= 0) store.devices.splice(i, 1);
-  return { removed: dev.id };
+
+  // Removing a node from the tenant it is PINNED to also drops the pin. An
+  // operator who removes a board from a tenant means "it doesn't belong here";
+  // leaving the pin in place re-provisioned it into the same tenant on the very
+  // next packet, which read as the Remove button not working. With the pin gone
+  // the board falls back to its own tid's tenant. A pin pointing at a DIFFERENT
+  // tenant is left alone: removing a stale leftover row must not undo a move.
+  let unpinned = false;
+  const pin = store.tenantByNodeId[dev.nodeId];
+  if (pin && pin.id === dev._tenantUuid) {
+    await adminPool.query('DELETE FROM node_tenant_assignments WHERE node_id = $1', [dev.nodeId]);
+    delete store.tenantByNodeId[dev.nodeId];
+    unpinned = true;
+    console.log(`[store] ${dev.id} removed from its pinned tenant — pin cleared, ` +
+                `'${dev.nodeId}' now routes by its own tid`);
+  }
+  return { removed: dev.id, unpinned };
 }
 
 export async function removeModule(dev, moduleId) {
