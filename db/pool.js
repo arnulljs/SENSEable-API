@@ -26,8 +26,16 @@ if (!process.env.DATABASE_URL) {
   console.warn('[pg] DATABASE_URL is not set — check your .env');
 }
 
+// PG_SSL=no-verify: TLS on, chain not verified. Needed when the pools point at
+// Supabase (the cloud bridge). A URL sslmode is not used for this because
+// pg-connection-string upgrades 'require' to verify-full, which hung on this
+// project's network — the same reason scripts/sync.js and api/_db.js set ssl
+// explicitly. Unset for local Postgres.
+const ssl = process.env.PG_SSL === 'no-verify' ? { rejectUnauthorized: false } : undefined;
+
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,          // senseable_app
+  ssl,
   max: Number(process.env.PG_POOL_MAX ?? 10),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
@@ -36,6 +44,7 @@ export const pool = new Pool({
 // Falls back to DATABASE_URL so a dev box that set only one URL still boots.
 export const adminPool = new Pool({
   connectionString: process.env.DATABASE_URL_OWNER ?? process.env.DATABASE_URL,
+  ssl,
   max: Number(process.env.PG_ADMIN_POOL_MAX ?? 4),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
@@ -54,7 +63,24 @@ for (const [name, p] of [['app', pool], ['admin', adminPool]]) {
  *     return rows;
  *   });
  */
-export async function withTenant(tenantId, fn) {
+// Every withTenant() transaction in flight. Ingest persists readings, device
+// state and presence fire-and-forget so the MQTT hot path never waits on the
+// database; a long-running server doesn't care when they land, but a Lambda
+// that returns early is frozen mid-write. drainWrites() lets it wait them out.
+const inflight = new Set();
+
+export async function drainWrites() {
+  while (inflight.size) await Promise.allSettled([...inflight]);
+}
+
+export function withTenant(tenantId, fn) {
+  const p = runWithTenant(tenantId, fn);
+  inflight.add(p);
+  p.then(() => inflight.delete(p), () => inflight.delete(p));
+  return p;
+}
+
+async function runWithTenant(tenantId, fn) {
   if (!tenantId) throw new Error('withTenant: tenantId is required');
   const client = await pool.connect();
   try {

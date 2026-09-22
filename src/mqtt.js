@@ -46,6 +46,7 @@ import { ingestTelemetry, ingestDiscovery, ingestAck } from './ingest.js';
 import { broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
 import { TOPIC_BASE } from './commands.js';
+import { setObservedRoute } from './role.js';
 
 // name -> { name, origin, url, client, stats }
 const brokers = new Map();
@@ -170,6 +171,7 @@ async function route(broker, topic, buf, retained = false) {
   }
 
   stats.lastPacketAt = Date.now();
+  setObservedRoute(origin);   // role.js: which tier owns notifications/dispatch
   stats.received[bucket] += 1;
 
   let result;

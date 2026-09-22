@@ -26,6 +26,7 @@ import { adminPool } from '../db/pool.js';
 import { publishCommand } from './mqtt.js';
 import { cmdTopic } from './commands.js';
 import { store, commandTidFor } from './store.js';
+import { ownsSideEffects } from './role.js';
 
 // A command that has been sitting in the outbox for longer than this is not
 // dispatched. An actuator instruction authored an hour ago and delivered now is
@@ -43,6 +44,10 @@ export const getDispatchStats = () => ({ ...stats });
 let running = false;
 
 export async function dispatchPendingCommands() {
+  // Both tiers see the outbox (the bridge directly, the edge via the sync
+  // worker's pull). Only the owning tier may publish, or a queued command is
+  // sent to the hardware twice. See role.js.
+  if (!ownsSideEffects()) return 0;
   if (running) return 0;
   running = true;
   stats.lastRunAt = Date.now();

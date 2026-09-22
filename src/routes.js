@@ -33,6 +33,7 @@ import { writeLimiter, commandLimiter, logSecurityEvent, getSecurityEvents } fro
 import { getPresenceStats } from './presence.js';
 import { getReconcileStats } from './reconcile.js';
 import { noteDashboardActivity, getClaimStats } from './claim.js';
+import { TIER, describeRole } from './role.js';
 
 export const router = Router();
 
@@ -463,7 +464,8 @@ router.get('/health', (_req, res) => {
     dispatch,
     // The tier answering this request. src/api.js uses it to label the
     // dashboard's connection chip without having to guess from the URL.
-    tier: 'edge',
+    tier: TIER,
+    role: describeRole(),
     now: new Date().toISOString(),
   });
 });

@@ -53,6 +53,8 @@ const BATCH = Number(process.env.SYNC_BATCH_SIZE ?? 500);
 const TABLES = [
   { name: 'roles',                strategy: 'static'    },
   { name: 'tenants',              strategy: 'timestamp' },
+  // Pins must agree on both tiers now that both ingest (migration 013).
+  { name: 'node_tenant_assignments', strategy: 'timestamp' },
   { name: 'users',                strategy: 'timestamp' },
   { name: 'sensor_profiles',      strategy: 'timestamp' },
   { name: 'devices',              strategy: 'timestamp' },
@@ -467,12 +469,13 @@ async function pullQueue(table, meta, q) {
 // upsert pass, and skips any tombstone whose row exists again locally: ids are
 // deterministic, so a node removed and then re-provisioned comes back with the
 // same device_id, and deleting it in the cloud would erase the live row.
-const DELETABLE = new Set(['devices', 'modules', 'ports', 'actuators']);
+const DELETABLE = new Set(['devices', 'modules', 'ports', 'actuators', 'node_tenant_assignments']);
 
-async function syncDeletions() {
+// Direction-agnostic: `src` holds the tombstones, `dest` receives the DELETEs.
+async function syncDeletions(src = localPool, dest = cloudPool) {
   let rows;
   try {
-    ({ rows } = await localPool.query(
+    ({ rows } = await src.query(
       'SELECT id, table_name, pk_col, pk FROM sync_deletions ORDER BY id LIMIT $1', [BATCH]));
   } catch (err) {
     if (err.code === '42P01') return 0;   // migration 012 not applied on this edge yet
@@ -487,15 +490,15 @@ async function syncDeletions() {
     // plain column name — never whatever happens to be in the row.
     if (!DELETABLE.has(r.table_name) || !/^[a-z_]+$/.test(r.pk_col)) { done.push(r.id); continue; }
 
-    const { rows: back } = await localPool.query(
+    const { rows: back } = await src.query(
       `SELECT 1 FROM "${r.table_name}" WHERE "${r.pk_col}" = $1`, [r.pk]);
     if (back.length) { done.push(r.id); continue; }
 
     if (!DRY) {
-      const c = await cloudPool.connect();
+      const c = await dest.connect();
       try {
         await c.query('BEGIN');
-        await c.query("SET LOCAL app.sync_replay = 'on'");   // don't tombstone in the cloud
+        await c.query("SET LOCAL app.sync_replay = 'on'");   // don't tombstone the replicated delete
         const res = await c.query(`DELETE FROM "${r.table_name}" WHERE "${r.pk_col}" = $1`, [r.pk]);
         await c.query('COMMIT');
         applied += res.rowCount ?? 0;
@@ -509,7 +512,7 @@ async function syncDeletions() {
     done.push(r.id);
   }
   if (!DRY && done.length) {
-    await localPool.query('DELETE FROM sync_deletions WHERE id = ANY($1::bigint[])', [done]);
+    await src.query('DELETE FROM sync_deletions WHERE id = ANY($1::bigint[])', [done]);
   }
   return applied;
 }
@@ -520,12 +523,24 @@ async function runOnce() {
   const failures = [];
 
   try {
-    const d = await syncDeletions();
+    const d = await syncDeletions(localPool, cloudPool);
     moved += d;
     if (d) log(`  ↑ deletions: ${d} row(s)${DRY ? ' (dry-run)' : ''}`);
   } catch (err) {
     failures.push(`deletions: ${err.message}`);
     log(`  deletions: FAILED — ${err.message}`);
+  }
+  // Deletes made on the cloud tier (the bridge, or the Vercel dashboard) come
+  // down before anything is pulled, for the same re-creation reason as above.
+  if (PULL) {
+    try {
+      const d = await syncDeletions(cloudPool, localPool);
+      moved += d;
+      if (d) log(`  ↓ deletions: ${d} row(s)${DRY ? ' (dry-run)' : ''}`);
+    } catch (err) {
+      failures.push(`down:deletions: ${err.message}`);
+      log(`  ↓ deletions: FAILED — ${err.message}`);
+    }
   }
 
   // ── UP: failover backlog and anything still authored on the edge ──────────

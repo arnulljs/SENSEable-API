@@ -11,7 +11,8 @@ import { securityHeaders, corsOptions, apiKeyGate, readLimiter } from './securit
 import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
 import { refreshAll } from './ingest.js';
-import { hydrate } from './store.js';
+import { hydrate, refreshRouting } from './store.js';
+import { TIER, CLOUD_BRIDGE_RUNNING } from './role.js';
 import { startRealtime, stopRealtime, broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
 import { dispatchPendingCommands } from './dispatch.js';
@@ -110,8 +111,21 @@ async function main() {
     dispatchPendingCommands();
   }, SWEEP_MS).unref();
 
-  const server = app.listen(PORT, () => {
-    console.log(`[http] SENSEable backend on http://localhost:${PORT}`);
+  // Pins and tid mappings can change underneath this process (the other tier
+  // writes them and the sync worker carries them here), so re-read them.
+  const ROUTING_REFRESH_MS = Number(process.env.ROUTING_REFRESH_MS ?? 15_000);
+  setInterval(() => {
+    refreshRouting().catch((e) => console.error('[store] routing refresh failed:', e.message));
+  }, ROUTING_REFRESH_MS).unref();
+
+  console.log(`[role] tier=${TIER}` + (TIER === 'edge'
+    ? (CLOUD_BRIDGE_RUNNING ? ' — cloud bridge running: mirror in normal operation, owner during failover'
+                            : ' — no cloud bridge declared: this server is the only writer')
+    : ' — cloud bridge: writes straight into Supabase, owns notifications and dispatch'));
+
+  const HOST = process.env.HOST ?? '0.0.0.0';
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`[http] SENSEable backend on http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`);
     console.log(`[http] devices: http://localhost:${PORT}/api/devices`);
     startMqtt();
   });

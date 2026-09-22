@@ -1,0 +1,23 @@
+# /etc/systemd/system/senseable-bridge.service
+# The cloud bridge: this repository's server with TIER=cloud, subscribed to
+# HiveMQ and writing straight into Supabase. See deploy/bridge/README.md.
+[Unit]
+Description=SENSEable cloud bridge (HiveMQ -> Supabase)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=senseable
+WorkingDirectory=/opt/senseable-bridge
+EnvironmentFile=/etc/senseable-bridge.env
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=5
+# The process reads its code and talks to the network; it writes nothing to disk.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

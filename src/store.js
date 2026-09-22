@@ -32,6 +32,7 @@ import { withTenant, adminPool } from '../db/pool.js';
 import { applyCalibration } from './calibration.js';
 import { STALE_MS, deriveModuleStatus } from './status.js';
 import { staleMsFor } from './reconcile.js';
+import { ownsSideEffects } from './role.js';
 
 const HISTORY_CAP = Number(process.env.HISTORY_CAP ?? 40);
 
@@ -73,7 +74,12 @@ export const store = {
 // Loads every tenant's tree. Runs as the OWNER (RLS-exempt) because boot-time
 // hydration legitimately spans all tenants; per-request writes still go through
 // withTenant() and are RLS-enforced.
-export async function hydrate() {
+// `lite` is for short-lived runs (the AWS Lambda bridge): load only what ingest
+// needs — tenants, pins, the device tree with calibration, actuators, recent
+// commands for ack matching — and skip the dashboard-only caches. The history
+// load in particular scans every reading ever stored and would grow with the
+// database on every one-minute invocation.
+export async function hydrate({ lite = false } = {}) {
   const { rows: tenants } = await adminPool.query(
     `SELECT tenant_id, slug, name, mqtt_tid FROM tenants ORDER BY slug`
   );
@@ -220,6 +226,12 @@ export async function hydrate() {
 
   // Recent history per port (LIMIT replaces the old in-memory splice cap —
   // and unlike the RAM version, this survives a restart).
+  if (lite) {
+    await loadCommands();
+    store.ready = true;
+    return store;
+  }
+
   await loadHistory();
 
   const { rows: notes } = await adminPool.query(`
@@ -648,6 +660,11 @@ async function persistActuator(node, act) {
 
 // Insert a notification (e.g. on command failure). Scoped to the node's tenant.
 export async function addNotification(node, { type, title, message }) {
+  // With a cloud bridge running, the bridge raises notifications for packets
+  // both tiers receive; raising them here too would put every alert on the
+  // dashboard twice (event_uid is random, so sync cannot collapse them). The
+  // edge still raises its own while failed over, when the bridge is blind.
+  if (!ownsSideEffects()) return null;
   const { rows } = await withTenant(node._tenantUuid, (c) =>
     c.query(
       // synced follows the same rule as readings: on the cloud tier a row is
@@ -776,6 +793,42 @@ function resolvePort(deviceId, moduleId, portId) {
   const d = store.devices.find((x) => x.id === deviceId);
   const m = d?.modules.find((x) => x.id === moduleId);
   return m?.ports.find((x) => x.id === portId) ?? null;
+}
+
+// ── Routing refresh ─────────────────────────────────────────────────────────
+// Tenant tid mappings and node pins used to be read once, at boot. With two
+// tiers ingesting, a pin set on one reaches the other through the sync worker —
+// straight into the database, behind this process's back — so both tiers
+// re-read routing on a timer (server.js). Tenant records are updated IN PLACE,
+// because devices and pins hold references to them.
+export async function refreshRouting() {
+  const { rows: tenants } = await adminPool.query(
+    'SELECT tenant_id, slug, name, mqtt_tid FROM tenants');
+  const byTid = {};
+  for (const t of tenants) {
+    const rec = store.tenants[t.slug] ?? (store.tenants[t.slug] = { slug: t.slug });
+    Object.assign(rec, { id: t.tenant_id, name: t.name, mqttTid: t.mqtt_tid });
+    if (t.mqtt_tid) byTid[t.mqtt_tid] = rec;
+  }
+  store.tenantByMqttTid = byTid;
+
+  let pins = [];
+  try {
+    ({ rows: pins } = await adminPool.query(
+      `SELECT a.node_id, t.slug FROM node_tenant_assignments a
+       JOIN tenants t ON t.tenant_id = a.tenant_id`));
+  } catch (e) {
+    if (e.code !== '42P01') throw e;
+  }
+  const next = {};
+  for (const p of pins) if (store.tenants[p.slug]) next[p.node_id] = store.tenants[p.slug];
+
+  // A pin that arrived or moved since the last read retires the node's row in
+  // every other tenant, exactly as a local assignment would.
+  for (const [nid, t] of Object.entries(next)) {
+    if (store.tenantByNodeId[nid]?.id !== t.id) retireRowsElsewhere(nid, t.id);
+  }
+  store.tenantByNodeId = next;
 }
 
 // ── NODE-TENANT-OVERRIDE: node tenant assignments (migration 011) ───────────
