@@ -416,7 +416,7 @@ export function pushHistory(port, value, status, opts = {}) {
   }
 
   persistReading(port, value, status, at, opts.origin ?? 'cloud', opts.replay === true,
-                 opts.raw ?? port.raw ?? 0)
+                 opts.raw ?? port.raw ?? 0, opts.net ?? null)
     .catch((e) => console.error('[store] persist reading failed:', e.message));
 }
 
@@ -443,7 +443,7 @@ const IS_CLOUD_TIER = process.env.TIER === 'cloud';
 // paying twice for every reading is not a steady state.
 const EDGE_BRIDGES_CLOUD = process.env.EDGE_BRIDGES_CLOUD === 'true';
 
-async function persistReading(port, value, status, at, origin, replay = false, raw = 0) {
+async function persistReading(port, value, status, at, origin, replay = false, raw = 0, net = null) {
   const dev = deviceOfPort(port);
   if (!dev) return;
   // A 'cloud'-origin row on the edge is a MIRROR of something the cloud already
@@ -452,10 +452,10 @@ async function persistReading(port, value, status, at, origin, replay = false, r
   const synced = IS_CLOUD_TIER || (origin === 'cloud' && !EDGE_BRIDGES_CLOUD);
   await withTenant(dev._tenantUuid, async (c) => {
     await c.query(
-      `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced, network_type)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
        ON CONFLICT (port_id, ts) DO NOTHING`,
-      [port._uuid, dev._tenantUuid, at, raw, value, status, origin, synced]
+      [port._uuid, dev._tenantUuid, at, raw, value, status, origin, synced, net]
     );
     // A replayed sample is history. Letting it write last_value would make the
     // dashboard show an outage-era reading as the current one.

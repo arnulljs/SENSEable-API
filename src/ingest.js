@@ -91,6 +91,17 @@ async function resolvePacketNode(pkt) {
   };
 }
 
+// The interface that carried this packet ("net" in tlm and disco). Accepts the
+// firmware's "wifi" | "cell" and tolerates "cellular"; anything else, or no key
+// at all (older firmware), is null — unknown is recorded as unknown.
+function packetNet(pkt) {
+  const n = String(pkt?.net ?? '').trim().toLowerCase();
+  if (n === 'wifi' || n === 'wi-fi') return 'wifi';
+  if (n === 'cell' || n === 'cellular') return 'cell';
+  return null;
+}
+const COMM_MODE = { wifi: 'Wi-Fi', cell: 'Cellular' };   // devices.comm_mode enum
+
 // Sample instant. The frozen tlm schema carries no timestamp today, so this
 // falls back to ingest time — but ingest time differs between the cloud path and
 // the failover path, and (port_id, ts) is the key reconciliation dedupes on. A
@@ -158,10 +169,14 @@ export async function ingestTelemetry(pkt, opts = {}) {
   if (error) return { ok: false, error };
   if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
 
-  if (replay) return ingestReplay(node, pkt, { origin, clock, scoped });
+  const net = packetNet(pkt);
+  if (replay) return ingestReplay(node, pkt, { origin, clock, scoped, net });
 
   const now = Date.now();
   node.lastSeen = now;
+  // Live packets say which interface the node is on NOW; persistDeviceState
+  // below writes it with the rest of the device row.
+  if (net) node.commMode = COMM_MODE[net];
 
   // Optional node-level status block (the frozen tlm schema has no `st`; kept
   // tolerant in case the firmware adds one later).
@@ -216,7 +231,7 @@ export async function ingestTelemetry(pkt, opts = {}) {
         lastSeen: port.lastSeen, now,
       });
 
-      pushHistory(port, port.value, port.status, { origin, ts }); // → INSERT INTO readings
+      pushHistory(port, port.value, port.status, { origin, ts, net }); // → INSERT INTO readings
       matched++;
     }
   }
@@ -232,7 +247,7 @@ export async function ingestTelemetry(pkt, opts = {}) {
 // sample without a believable device timestamp cannot be placed on the timeline
 // at all (stamping it "now" would put outage-era data on top of the present and
 // collide with the live sample on (port_id, ts)), so it is dropped and counted.
-async function ingestReplay(node, pkt, { origin, clock, scoped }) {
+async function ingestReplay(node, pkt, { origin, clock, scoped, net }) {
   let stored = 0, unmatched = 0, provisioned = 0, skipped = 0, undatable = 0;
 
   for (const module of pkt.adc ?? []) {
@@ -256,7 +271,9 @@ async function ingestReplay(node, pkt, { origin, clock, scoped }) {
         safeMin: port.safeMin, safeMax: port.safeMax,
         lastSeen: clock.at.getTime(), now: clock.at.getTime(),
       });
-      pushHistory(port, value, status, { origin, ts: clock.at, replay: true, raw });
+      // A replay is history: it records the network each sample came in on,
+      // but never changes the device's current interface.
+      pushHistory(port, value, status, { origin, ts: clock.at, replay: true, raw, net });
       stored++;
     }
   }
@@ -279,6 +296,15 @@ export async function ingestDiscovery(pkt) {
   if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
 
   node.lastSeen = Date.now();
+
+  // Discovery is sent on every (re)connect, so it is the first to report an
+  // interface change — e.g. a node rebooted from Wi-Fi into cellular mode.
+  const net = packetNet(pkt);
+  if (net && node.commMode !== COMM_MODE[net]) {
+    node.commMode = COMM_MODE[net];
+    persistDeviceState(node).catch((e) =>
+      console.error('[ingest] persist comm mode failed:', e.message));
+  }
 
   let connected = 0, disconnected = 0, disabled = 0, unmatched = 0, provisioned = 0;
 
