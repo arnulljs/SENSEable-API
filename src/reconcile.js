@@ -47,7 +47,7 @@
 // discovery repeats; a correction lost to a dropped broker connection is simply
 // re-derived from the next discovery packet.
 
-import { recordCommand, commandTidFor } from './store.js';
+import { recordCommand, commandTidFor, refreshConfig } from './store.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand } from './mqtt.js';
 
@@ -82,6 +82,12 @@ export function getReconcileStats() {
  * packet itself is still good information.
  */
 export async function reconcileNode(node, pkt) {
+  // Act on the operator's CURRENT intent, not the copy loaded at boot: a
+  // dashboard edit made on the other tier may have arrived through the sync
+  // since then. Without this, reconcile "corrected" a channel the operator had
+  // just disabled on Vercel straight back on.
+  await refreshConfig().catch((e) => console.warn('[reconcile] config refresh failed:', e.message));
+
   const drift = [];
 
   for (const bus of pkt.buses ?? []) {

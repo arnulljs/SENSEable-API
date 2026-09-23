@@ -11,7 +11,7 @@ import { securityHeaders, corsOptions, apiKeyGate, readLimiter } from './securit
 import { router } from './routes.js';
 import { startMqtt } from './mqtt.js';
 import { refreshAll } from './ingest.js';
-import { hydrate, refreshRouting } from './store.js';
+import { hydrate, refreshRouting, refreshConfig } from './store.js';
 import { TIER, CLOUD_BRIDGE_RUNNING } from './role.js';
 import { startRealtime, stopRealtime, broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
@@ -116,6 +116,7 @@ async function main() {
   const ROUTING_REFRESH_MS = Number(process.env.ROUTING_REFRESH_MS ?? 15_000);
   setInterval(() => {
     refreshRouting().catch((e) => console.error('[store] routing refresh failed:', e.message));
+    refreshConfig().catch((e) => console.error('[store] config refresh failed:', e.message));
   }, ROUTING_REFRESH_MS).unref();
 
   console.log(`[role] tier=${TIER}` + (TIER === 'edge'

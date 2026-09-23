@@ -244,7 +244,7 @@ async function push(table, rows, meta, mode, opts = {}) {
   // rewrites every row it offers, rowCount always equals the batch size, and the
   // worker reports (and NOTIFYs) work it did not do. With a downward pass added
   // that noise doubled — `roles` alone woke every dashboard socket every tick.
-  const action = (mode === 'identity' || mode === 'queue') || !updatable.length
+  const action = (mode === 'identity' || mode === 'queue' || mode === 'insert-only') || !updatable.length
     ? 'DO NOTHING'
     : `DO UPDATE SET ${updatable.map((c) => `"${c}" = EXCLUDED."${c}"`).join(', ')}
        WHERE _t.* IS DISTINCT FROM EXCLUDED.*`;
@@ -354,6 +354,19 @@ async function syncQueue(table, meta, q) {
 // TIMESTAMP: mutable rows, chased by (updated_at, pk) and applied as an upsert.
 // Direction is a parameter — configuration flows DOWN under cloud-first, while
 // everything else still flows up.
+// Tables describing physical hardware. Their rows mix live state (last_seen,
+// last_value, last_status) that the INGESTING tier writes every few seconds with
+// operator settings (enabled, labels, ranges) edited on either dashboard.
+// Once the cloud ingests on its own (EDGE_BRIDGES_CLOUD=false: the Lambda
+// bridge), both tiers write these rows, and a whole-row upsert lets whichever
+// pushed last win: the edge's copy — touched every 15 s by presence — kept
+// overwriting the cloud's, reverting dashboard edits and flipping channels
+// between Disabled, Offline and stale statuses on the deployed site. So in that
+// mode the edge only ADDS rows the cloud has never seen (hardware first met
+// during a failover) and otherwise takes the cloud's version on the pull.
+const HARDWARE_TABLES = new Set(['devices', 'modules', 'ports', 'actuators']);
+const CLOUD_OWNS_HARDWARE = process.env.EDGE_BRIDGES_CLOUD === 'false';
+
 async function syncTimestamp(table, meta, dir = {}) {
   const src = dir.src ?? localPool;
   const dest = dir.dest ?? cloudPool;
@@ -385,7 +398,7 @@ async function syncTimestamp(table, meta, dir = {}) {
       [curAt, curKey, BATCH]);
     if (!rows.length) break;
 
-    total += await push(table, rows, meta, 'timestamp', { dest });
+    total += await push(table, rows, meta, dir.insertOnly ? 'insert-only' : 'timestamp', { dest });
     const last = rows[rows.length - 1];
     curAt = last._wm_at;
     curKey = last._wm_key;
@@ -551,7 +564,7 @@ async function runOnce() {
 
       const n = strategy === 'queue'   ? await syncQueue(name, meta, queue)
               : strategy === 'static'  ? await syncStatic(name, meta)
-              :                          await syncTimestamp(name, meta);
+              :                          await syncTimestamp(name, meta, { insertOnly: CLOUD_OWNS_HARDWARE && HARDWARE_TABLES.has(name) });
       moved += n;
       if (n) log(`  ↑ ${name}: ${n} row(s)${DRY ? ' (dry-run)' : ''}`);
     } catch (err) {

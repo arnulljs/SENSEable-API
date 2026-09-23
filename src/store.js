@@ -831,6 +831,55 @@ export async function refreshRouting() {
   store.tenantByNodeId = next;
 }
 
+// ── Config refresh ──────────────────────────────────────────────────────────
+// Operator settings edited on the CLOUD dashboard (enable/disable, labels,
+// ranges, calibration, names) reach this server's database through the sync
+// worker's pull — but this process only read them at boot, so it kept acting
+// on the old values. Concretely: a channel disabled on Vercel stayed enabled in
+// memory here, reconcile saw the firmware report DISABLED, decided that was
+// drift, and re-enabled it — undoing the operator's change. Re-reading config
+// on a timer, and before reconcile acts, keeps memory in step with the database.
+export async function refreshConfig() {
+  const { rows } = await adminPool.query(`
+    SELECT p.port_id, p.enabled, p.disabled_reason, p.label, p.unit,
+           p.range_min, p.range_max, p.safe_min, p.safe_max,
+           p.cal_type, p.cal_slope, p.cal_offset, p.configured,
+           f.label AS formula_label, f.expression AS formula_expr,
+           m.module_id, m.name AS module_name, d.device_id, d.name AS device_name
+    FROM ports p
+    JOIN modules m ON m.module_id = p.module_id
+    JOIN devices d ON d.device_id = m.device_id
+    LEFT JOIN calibration_formulas f ON f.formula_id = p.formula_id`);
+  const byPort = new Map(rows.map((r) => [r.port_id, r]));
+  const byModule = new Map(rows.map((r) => [r.module_id, r.module_name]));
+  const byDevice = new Map(rows.map((r) => [r.device_id, r.device_name]));
+  for (const d of store.devices) {
+    if (byDevice.has(d._uuid)) d.name = byDevice.get(d._uuid);
+    for (const m of d.modules) {
+      if (byModule.has(m._uuid)) m.name = byModule.get(m._uuid);
+      for (const p of m.ports) {
+        const r = byPort.get(p._uuid);
+        if (!r) continue;
+        const wasEnabled = p.enabled !== false;
+        Object.assign(p, {
+          enabled: r.enabled !== false,
+          disabledReason: r.disabled_reason ?? null,
+          label: r.label, unit: r.unit,
+          rangeMin: r.range_min, rangeMax: r.range_max,
+          safeMin: r.safe_min, safeMax: r.safe_max,
+          configured: r.configured ?? p.configured,
+          formulaLabel: r.formula_label ?? null,
+          calibration: r.cal_type === 'expr' && r.formula_expr
+            ? { type: 'expr', expr: r.formula_expr }
+            : { type: 'linear', slope: r.cal_slope, offset: r.cal_offset },
+        });
+        if (wasEnabled && !p.enabled) p.status = 'Disabled';
+      }
+    }
+  }
+  rebuildChannelAssignments();
+}
+
 // ── NODE-TENANT-OVERRIDE: node tenant assignments (migration 011) ───────────
 // Cross-tenant routing metadata, so it goes through adminPool (the same reason
 // sync_state does) rather than any single tenant's RLS scope. Testing tool: it
