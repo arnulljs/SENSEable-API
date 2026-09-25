@@ -42,7 +42,7 @@
 // either, so "connected but silent" and "connected and working" looked
 // identical. Both are checked and surfaced below, per broker.
 
-import { ingestTelemetry, ingestDiscovery, ingestAck } from './ingest.js';
+import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus } from './ingest.js';
 import { broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
 import { TOPIC_BASE } from './commands.js';
@@ -65,10 +65,10 @@ function blankStats(url, origin) {
     connects: 0,
     closes: 0,
     lastError: null,
-    received: { tlm: 0, disco: 0, ack: 0, other: 0 },
+    received: { tlm: 0, disco: 0, ack: 0, status: 0, other: 0 },
     // Retained replays the broker handed us on subscribe. Counted, never
     // ingested — see route().
-    retained: { tlm: 0, disco: 0, ack: 0, other: 0 },
+    retained: { tlm: 0, disco: 0, ack: 0, status: 0, other: 0 },
     accepted: 0,
     rejected: 0,
     lastPacketAt: null,
@@ -149,7 +149,7 @@ async function route(broker, topic, buf, retained = false) {
 
   // Prefer the packet's own type; fall back to the topic suffix.
   const kind = pkt.t ?? topic.split('/').pop();
-  const bucket = kind === 'tlm' || kind === 'disco' || kind === 'ack' ? kind : 'other';
+  const bucket = ['tlm', 'disco', 'ack', 'status'].includes(kind) ? kind : 'other';
 
   // RETAINED MESSAGES ARE NOT PRESENCE.
   // The firmware publishes discovery with retain=1, so the broker keeps the last
@@ -161,6 +161,18 @@ async function route(broker, topic, buf, retained = false) {
   // node republishes discovery live on every (re)connect anyway. It is also kept
   // out of lastPacketAt, which publishCommand() and the observed route use to
   // decide which broker the node is on.
+  // Status is presence, not sensor data: a retained 'online' on subscribe is
+  // still the node's current state, and an 'offline' LWT is always live. Route
+  // status regardless of the retained flag; the retained short-circuit below is
+  // only for tlm/disco/ack sensor replays.
+  if (kind === 'status') {
+    stats.received.status = (stats.received.status ?? 0) + 1;
+    const r = await ingestStatus(pkt, { origin }).catch((e) => ({ ok: false, error: e.message }));
+    if (r?.ok) { checkAllPresence(); broadcastDevices(); }
+    else if (r?.error) console.warn(`[mqtt:${name}] ${topic}: ${r.error}`);
+    return;
+  }
+
   if (retained) {
     stats.retained[bucket] += 1;
     if (!retainedLogged.has(topic)) {
@@ -274,6 +286,7 @@ async function connectBroker({ name, url, origin }) {
     `${base}/${tid}/${nid}/tlm`,
     `${base}/${tid}/${nid}/disco`,
     `${base}/${tid}/${nid}/ack`,
+    `${base}/${tid}/${nid}/status`,   // LWT online/offline (Korinne's contract)
   ];
 
   client.on('connect', () => {

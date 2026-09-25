@@ -967,8 +967,12 @@ export function commandTidFor(dev) {
 const isPortActive   = (p, now = Date.now()) => p.lastSeen != null && now - p.lastSeen <= STALE_MS;
 const isModuleActive = (m, now = Date.now()) =>
   (m.lastSeen != null && now - m.lastSeen <= STALE_MS) || m.ports.some((p) => isPortActive(p, now));
+// A node the broker reported OFFLINE via LWT is not active, even if its last
+// telemetry is still inside the staleness window — the LWT is proof the socket
+// dropped. lwtOnline === true / undefined leaves the staleness check in charge.
 const isDeviceActive = (d, now = Date.now()) =>
-  (d.lastSeen != null && now - d.lastSeen <= STALE_MS) || d.modules.some((m) => isModuleActive(m, now));
+  d.lwtOnline !== false &&
+  ((d.lastSeen != null && now - d.lastSeen <= STALE_MS) || d.modules.some((m) => isModuleActive(m, now)));
 
 export function projectDevices(tenantId = null) {
   const now = Date.now();

@@ -26,13 +26,13 @@
 
 import mqtt from 'mqtt';
 import { hydrate } from '../src/store.js';
-import { ingestTelemetry, ingestDiscovery, ingestAck } from '../src/ingest.js';
+import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus } from '../src/ingest.js';
 import { drainWrites } from '../db/pool.js';
 
 const IDLE_MS   = Number(process.env.COLLECT_IDLE_MS ?? 3000);    // stop after this long with no message
 const MAX_MS    = Number(process.env.COLLECT_MAX_MS ?? 35000);    // hard cap per run
 const CLIENT_ID = process.env.MQTT_CLIENT_ID ?? 'senseable-lambda-bridge';
-const TOPICS    = ['tlm', 'disco', 'ack'].map((k) => `usc/thesis/+/+/${k}`);
+const TOPICS    = ['tlm', 'disco', 'ack', 'status'].map((k) => `usc/thesis/+/+/${k}`);
 
 function collect() {
   return new Promise((resolve, reject) => {
@@ -86,11 +86,12 @@ async function ingestOne({ topic, payload, retain }) {
   if (retain) return 'retained';
   let pkt;
   try { pkt = JSON.parse(payload.toString()); } catch { return 'bad-json'; }
-  const kind = pkt.t ?? topic.split('/').pop();
+  const kind = pkt.t === 'lwt' ? 'status' : (pkt.t ?? topic.split('/').pop());
   let r;
-  if (kind === 'tlm')        r = await ingestTelemetry(pkt, { origin: 'cloud' });
-  else if (kind === 'disco') r = await ingestDiscovery(pkt);
-  else if (kind === 'ack')   r = await ingestAck(pkt);
+  if (kind === 'tlm')         r = await ingestTelemetry(pkt, { origin: 'cloud' });
+  else if (kind === 'disco')  r = await ingestDiscovery(pkt);
+  else if (kind === 'ack')    r = await ingestAck(pkt);
+  else if (kind === 'status') r = await ingestStatus(pkt, { origin: 'cloud' });   // LWT
   else return 'ignored';
   if (!r?.ok) { console.warn(`[bridge] ${topic}: ${r?.error}`); return 'rejected'; }
   return r.replay ? 'replay' : 'ok';

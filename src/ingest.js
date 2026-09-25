@@ -440,6 +440,37 @@ export async function ingestAck(pkt) {
   };
 }
 
+// --- Status / LWT ('status') ------------------------------------------------
+// The firmware sets an MQTT Last Will on usc/thesis/{tid}/{nid}/status: the
+// broker publishes {"t":"lwt","status":"offline"} the instant the node's socket
+// drops, and the node itself publishes {"status":"online"} (retained) on
+// connect. This is a definitive presence signal — a clean disconnect is known
+// immediately, instead of waiting out the staleness window. The staleness sweep
+// stays as the fallback for a node that vanishes without the broker noticing
+// (power-cut on the broker link, say), so lwtOnline is advisory: it forces
+// Offline when false, but never masks a node the sweep already considers dead.
+export async function ingestStatus(pkt, opts = {}) {
+  if (!pkt) return { ok: false, error: 'empty status packet' };
+  const raw = String(pkt.status ?? '').toLowerCase();
+  if (raw !== 'online' && raw !== 'offline') {
+    return { ok: false, error: `status must be 'online' or 'offline', got '${pkt.status}'` };
+  }
+  const online = raw === 'online';
+
+  const { node, scoped, error } = await resolvePacketNode(pkt);
+  if (error) return { ok: false, error };
+  if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
+
+  node.lwtOnline = online;
+  node.lwtAt = Date.now();
+  if (online) node.lastSeen = Date.now();   // an online LWT is a fresh sighting
+  // Recompute from the cleared/!cleared LWT gate: offline pins it Offline, online
+  // hands the decision back to the ports + staleness so the dot is correct at once.
+  refreshNodeStatus(node);
+
+  return { ok: true, node: node.id, tenantScoped: scoped, presence: raw, lwt: true };
+}
+
 // Recompute one node's status from its ports + staleness.
 export function refreshNodeStatus(node, now = Date.now()) {
   // Per-node staleness; see staleMsFor() in reconcile.js for why one global
@@ -460,9 +491,14 @@ export function refreshNodeStatus(node, now = Date.now()) {
       portStatuses.push(p.status);
     }
   }
-  node.status = deriveNodeStatus({
-    portStatuses, systemFault: node.systemFault, lastSeen: node.lastSeen, now, staleMs,
-  });
+  // A node the broker reported OFFLINE via LWT stays Offline until it reconnects
+  // (an online LWT or fresh telemetry clears it), whatever its last-known ports
+  // said — the socket is provably down.
+  node.status = node.lwtOnline === false
+    ? 'offline'
+    : deriveNodeStatus({
+        portStatuses, systemFault: node.systemFault, lastSeen: node.lastSeen, now, staleMs,
+      });
 }
 
 export function refreshAll(now = Date.now()) {
