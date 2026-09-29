@@ -301,9 +301,7 @@ export async function ingestDiscovery(pkt) {
   // interface change — e.g. a node rebooted from Wi-Fi into cellular mode.
   const net = packetNet(pkt);
   if (net && node.commMode !== COMM_MODE[net]) {
-    node.commMode = COMM_MODE[net];
-    persistDeviceState(node).catch((e) =>
-      console.error('[ingest] persist comm mode failed:', e.message));
+    node.commMode = COMM_MODE[net];   // persisted by the persistDeviceState at the end
   }
 
   let connected = 0, disconnected = 0, disabled = 0, unmatched = 0, provisioned = 0;
@@ -363,6 +361,13 @@ export async function ingestDiscovery(pkt) {
   }
 
   refreshNodeStatus(node, Date.now());
+  // Persist presence even though discovery carries no readings. A node with no
+  // ADCs sends ONLY discovery (never telemetry), so without this its last_seen
+  // never advances in the database — the edge's live subscription looked online
+  // while the cloud (which only sees what's written) stayed frozen. This is the
+  // one write that makes a sensorless-but-alive node show online in the cloud.
+  persistDeviceState(node).catch((e) =>
+    console.error('[ingest] persist device state (disco) failed:', e.message));
   return {
     ok: true, node: node.id, tenantScoped: scoped,
     detectedChips: pkt.detected_chips ?? null,
