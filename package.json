@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Barebones backend for SENSEable \u2014 ingests raw ADC telemetry (frozen wire protocol), applies calibration, serves the React dashboard's data shape over REST.",
+  "description": "Barebones backend for SENSEable — ingests raw ADC telemetry (frozen wire protocol), applies calibration, serves the React dashboard's data shape over REST.",
   "engines": {
     "node": ">=18"
   },
@@ -26,6 +26,7 @@
     "simulate:local": "node scripts/simulate.js --local --seconds 30"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
