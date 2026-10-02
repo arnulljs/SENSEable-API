@@ -114,7 +114,7 @@ export async function hydrate({ lite = false } = {}) {
   const { rows } = await adminPool.query(`
     SELECT
       d.device_id, d.node_id, d.name AS device_name, d.status AS device_status,
-      d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms,
+      d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms, d.lwt_online,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
       m.last_seen AS module_last_seen, m.configured AS module_configured,
@@ -153,6 +153,7 @@ export async function hydrate({ lite = false } = {}) {
         // rather than reverting to the global default for a node we already
         // know publishes slowly.
         tlmIntervalMs: r.tlm_interval_ms ?? null,
+        lwtOnline: r.lwt_online ?? null,
         systemFault: 0,
         lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
         modules: [],
@@ -480,6 +481,12 @@ export async function persistTlmInterval(node, ms) {
     c.query('UPDATE devices SET tlm_interval_ms = $2 WHERE device_id = $1',
       [node._uuid, ms])).catch((e) =>
     console.error('[store] persist tlm_interval failed:', e.message));
+}
+
+export async function persistLwt(dev, online) {
+  if (!dev?._uuid) return;
+  await withTenant(dev._tenantUuid, (c) =>
+    c.query('UPDATE devices SET lwt_online = $2 WHERE device_id = $1', [dev._uuid, online]));
 }
 
 export async function persistDeviceState(dev) {

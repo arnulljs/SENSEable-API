@@ -9,7 +9,7 @@
 //
 // Branches (discriminated by `action`):
 //   bus_recovery        { bus_id:0|1 }
-//   actuate             { port:1..6, mode:"bin"|"pwm", dur:>=0,
+//   actuate             { port:1..8, mode:"bin"|"pwm", dur:>=0,
 //                         state:0|1        (mode=bin),
 //                         duty:0..255      (mode=pwm) }
 //   sensor_port_up|down { chip:0..3, ch:0..3 }
@@ -72,8 +72,8 @@ export function buildBusRecovery({ tid, nid, busId = 0, cid, ts }) {
 // Branch B — multi-channel actuator driver.
 export function buildActuate({ tid, nid, port, mode, state, duty, dur = 0, cid, ts }) {
   const p = parsePortNumber(port);
-  if (!Number.isInteger(p) || p < 1 || p > 6) {
-    throw new Error('port must map to OUT1..OUT6 (integer 1..6)');
+  if (!Number.isInteger(p) || p < 1 || p > 8) {
+    throw new Error('port must map to OUT1..OUT8 (integer 1..8)');
   }
   const m = String(mode).toLowerCase();
   if (m !== 'bin' && m !== 'pwm') throw new Error(`mode must be "bin" or "pwm" (got "${mode}")`);

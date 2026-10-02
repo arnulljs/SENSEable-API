@@ -34,12 +34,17 @@ import { withTenant } from '../db/pool.js';
 import { store, deviceKey } from './store.js';
 
 // Node outputs are a fixed property of the ESP32 board per the frozen protocol
-// (port 1..6 == OUT1..OUT6), not a detachable accessory that discovery reports.
+// (port 1..8 == OUT1..OUT8), not a detachable accessory that discovery reports.
 // They're created with the device so the Control page has something to address.
 // Set AUTO_PROVISION_ACTUATORS=false to leave the actuator list empty until you
 // add outputs deliberately.
 const AUTO_ACTUATORS = process.env.AUTO_PROVISION_ACTUATORS !== 'false';
-const ACTUATOR_COUNT = Math.min(6, Math.max(0, Number(process.env.ACTUATOR_COUNT ?? 6)));
+const ACTUATOR_COUNT = Math.min(8, Math.max(0, Number(process.env.ACTUATOR_COUNT ?? 8)));
+
+// Firmware pin map (NUM_ACTUATORS 8): OUT_n drives actuator_gpios[n-1] on LEDC
+// channel n-1. Stored for display only; the backend addresses outputs by OUTn
+// and the firmware owns the pin lookup. Keep in lockstep with actuator_gpios[].
+const ACTUATOR_GPIOS = [4, 25, 13, 19, 26, 27, 33, 18];
 
 // Guards against two packets racing to create the same row. The DB has unique
 // constraints as the real defence; this just avoids pointless round-trips and
@@ -134,12 +139,12 @@ async function provisionActuators(tenantUuid, dev) {
     for (let n = 1; n <= ACTUATOR_COUNT; n += 1) {
       const { rows: r } = await c.query(
         `INSERT INTO actuators (actuator_id, device_id, tenant_id, actuator_code, name, port,
-                                channel, mode, state, duty, dur, last_ack)
-         VALUES (senseable_uuid('actuator', $1::text, $5), $1::uuid, $2::uuid, $3, $4, $5, $6, 'bin', 0, 0, 0, 'pending')
+                                channel, gpio, mode, state, duty, dur, last_ack)
+         VALUES (senseable_uuid('actuator', $1::text, $5), $1::uuid, $2::uuid, $3, $4, $5, $6, $7, 'bin', 0, 0, 0, 'pending')
          ON CONFLICT (device_id, port) DO NOTHING
          RETURNING actuator_code, name, port, channel, gpio, mode,
                    state, duty, dur, last_ack, updated_at`,
-        [dev._uuid, tenantUuid, `out${n}`, `Output ${n}`, `OUT${n}`, n - 1]);
+        [dev._uuid, tenantUuid, `out${n}`, `Output ${n}`, `OUT${n}`, n - 1, ACTUATOR_GPIOS[n - 1] ?? null]);
       if (r[0]) out.push(r[0]);
     }
     return out;

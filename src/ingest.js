@@ -11,7 +11,7 @@
 // "N001" can never write into another tenant's device.
 
 import {
-  store, findNode, findPortByChannel, pushHistory,
+  store, findNode, findPortByChannel, pushHistory, persistLwt,
   applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
   updateCommandStatus, setActuatorAck, addNotification,
 } from './store.js';
@@ -469,6 +469,7 @@ export async function ingestStatus(pkt, opts = {}) {
   node.lwtOnline = online;
   node.lwtAt = Date.now();
   if (online) node.lastSeen = Date.now();   // an online LWT is a fresh sighting
+  persistLwt(node, online).catch((e) => console.error('[ingest] persist lwt failed:', e.message));
   // Recompute from the cleared/!cleared LWT gate: offline pins it Offline, online
   // hands the decision back to the ports + staleness so the dot is correct at once.
   refreshNodeStatus(node);
