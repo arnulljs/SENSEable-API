@@ -341,14 +341,39 @@ async function loadCommands() {
     }
     throw e;
   }
-  store.commands = rows.map((c) => ({
-    id: c.command_id, cid: c.cid, tenantId: c.slug,
-    deviceId: deviceKey(c.slug, c.node_id),
-    action: c.action, mode: c.mode, port: c.port,
-    payload: c.payload, status: c.status, msg: c.msg,
-    createdAt: new Date(c.created_at).getTime(),
-    ackedAt: c.acked_at ? new Date(c.acked_at).getTime() : null,
-  }));
+  store.commands = rows.map(commandRec);
+}
+
+const commandRec = (c) => ({
+  id: c.command_id, cid: c.cid, tenantId: c.slug,
+  deviceId: deviceKey(c.slug, c.node_id),
+  action: c.action, mode: c.mode, port: c.port,
+  payload: c.payload, status: c.status, msg: c.msg,
+  createdAt: new Date(c.created_at).getTime(),
+  ackedAt: c.acked_at ? new Date(c.acked_at).getTime() : null,
+});
+
+// A command queued from the CLOUD dashboard never passes through this process's
+// POST /commands: it arrives as an outbox row (sync pull → dispatcher on the
+// edge; straight from Supabase for the Lambda bridge). So it is not in the cache
+// when the node acks it, and the ack used to be dropped as an orphan — the
+// command stayed 'pending' and a timed run never flipped back to OFF. Load it
+// on demand instead, scoped to the node that sent the ack, so one node can
+// never close out another node's command by quoting its cid.
+async function loadCommandForNode(cid, node) {
+  const { rows } = await adminPool.query(`
+    SELECT c.command_id, c.cid, c.action, c.mode, c.port, c.payload,
+           c.status, c.msg, c.created_at, c.acked_at, t.slug, d.node_id
+    FROM commands c
+    JOIN tenants t ON t.tenant_id = c.tenant_id
+    JOIN devices d ON d.device_id = c.device_id
+    WHERE c.cid = $1 AND c.device_id = $2
+    LIMIT 1`, [cid, node._uuid]);
+  if (!rows.length) return null;
+  const rec = commandRec(rows[0]);
+  store.commands.unshift(rec);
+  if (store.commands.length > COMMAND_CAP) store.commands.length = COMMAND_CAP;
+  return rec;
 }
 
 // channelAssignments is a derived view over ports.formula_id, keyed by module.
@@ -604,8 +629,14 @@ export async function recordCommand(dev, envelope) {
 
 // Update a command's lifecycle status from an incoming ack. Returns the cache
 // record (with .action/.port) so ingest can reflect it on the actuator.
-export function updateCommandStatus(cid, status, msg, terminal = false) {
-  const rec = store.commands.find((c) => c.cid === cid);
+export async function updateCommandStatus(cid, status, msg, terminal = false, node = null) {
+  let rec = store.commands.find((c) => c.cid === cid);
+  if (!rec && node) {
+    rec = await loadCommandForNode(cid, node).catch((e) => {
+      console.error('[store] command lookup failed:', e.message);
+      return null;
+    });
+  }
   if (rec) {
     rec.status = status;
     rec.msg = msg;

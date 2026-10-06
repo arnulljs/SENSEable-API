@@ -348,6 +348,12 @@ router.post('/commands', wrap(async (req, res) => {
       duty: envelope.duty,
       dur: envelope.dur,
     });
+    // Cross-operator actuation lockout: push the 'pending' state to every other
+    // open dashboard NOW, before the ack returns, so their Start button greys
+    // out the moment this output goes in-flight. The ack path already
+    // broadcasts (mqtt route / POST /ingest/ack), which releases the lock when
+    // a terminal status lands; this is the matching edge for the issue side.
+    broadcastDevices();
   }
 
   const topic = cmdTopic(tid, dev.nodeId);

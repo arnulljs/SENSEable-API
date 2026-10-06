@@ -404,7 +404,7 @@ export async function ingestAck(pkt) {
   const terminal = ACK_TERMINAL.has(status);
 
   // 1. Update the command record (fire-and-forget persistence).
-  const cmd = updateCommandStatus(pkt.cid, status, pkt.msg ?? null, terminal);
+  const cmd = await updateCommandStatus(pkt.cid, status, pkt.msg ?? null, terminal, node);
 
   // 2. Reflect on the target actuator, if this ack is for an actuate command.
   let actuator = null;
