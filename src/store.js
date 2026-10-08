@@ -115,6 +115,8 @@ export async function hydrate({ lite = false } = {}) {
     SELECT
       d.device_id, d.node_id, d.name AS device_name, d.status AS device_status,
       d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms, d.lwt_online,
+      d.wire_tid,
+      d.active_hw_mode, d.wifi_ssid, d.cell_apn, d.target_broker, d.last_config_sync,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
       m.last_seen AS module_last_seen, m.configured AS module_configured,
@@ -154,6 +156,14 @@ export async function hydrate({ lite = false } = {}) {
         // know publishes slowly.
         tlmIntervalMs: r.tlm_interval_ms ?? null,
         lwtOnline: r.lwt_online ?? null,
+        // Restored so a pinned node is addressable right after a restart (and in
+        // every Lambda run), not only once it has published again.
+        wireTid: r.wire_tid ?? null,
+        // Configuration twin (migration 019), as the node last reported it.
+        hwConfig: r.last_config_sync ? {
+          mode: r.active_hw_mode, ssid: r.wifi_ssid, apn: r.cell_apn,
+          broker: r.target_broker, syncedAt: new Date(r.last_config_sync).getTime(),
+        } : null,
         systemFault: 0,
         lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
         modules: [],
@@ -506,6 +516,30 @@ export async function persistTlmInterval(node, ms) {
     c.query('UPDATE devices SET tlm_interval_ms = $2 WHERE device_id = $1',
       [node._uuid, ms])).catch((e) =>
     console.error('[store] persist tlm_interval failed:', e.message));
+}
+
+// The tid this board really publishes under (migration 018). The cloud API reads
+// it to publish a command straight to a pinned node's real topic. Set in memory
+// synchronously (the dispatcher in the same Lambda run needs it); persisted only
+// when it changes, so it costs one UPDATE when a node is first heard or moves.
+export async function persistWireTid(node, tid) {
+  if (!tid || node.wireTid === tid) return;
+  node.wireTid = tid;
+  if (!node._uuid) return;
+  await withTenant(node._tenantUuid, (c) =>
+    c.query('UPDATE devices SET wire_tid = $2 WHERE device_id = $1', [node._uuid, tid]))
+    .catch((e) => console.error('[store] persist wire_tid failed:', e.message));
+}
+
+export async function persistHwConfig(dev) {
+  const c = dev?.hwConfig;
+  if (!dev?._uuid || !c) return;
+  await withTenant(dev._tenantUuid, (q) =>
+    q.query(
+      `UPDATE devices SET active_hw_mode=$2, wifi_ssid=$3, cell_apn=$4, target_broker=$5,
+              last_config_sync=to_timestamp($6/1000.0)
+       WHERE device_id=$1`,
+      [dev._uuid, c.mode, c.ssid, c.apn, c.broker, c.syncedAt]));
 }
 
 export async function persistLwt(dev, online) {
@@ -1021,6 +1055,7 @@ export function projectDevices(tenantId = null) {
       status: d.status, commMode: d.commMode,
       uptime: d.uptime, rssi: d.rssi, freeHeap: d.freeHeap,
       lastSeen: d.lastSeen ?? null,
+      hwConfig: d.hwConfig ?? null,
       active: isDeviceActive(d, now),
       configured: d.configured ?? true,
       modules: d.modules.map((m) => {

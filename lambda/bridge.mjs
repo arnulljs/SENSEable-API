@@ -21,18 +21,22 @@
 // Readings keep their device timestamp (`ts`), so a sample processed up to a
 // minute late is still filed at the moment it was taken.
 //
-// Data-only (BRIDGE_SIDE_EFFECTS=false): notifications and command dispatch
-// stay on the edge server, which keeps CLOUD_BRIDGE_RUNNING unset.
+// Data-only (BRIDGE_SIDE_EFFECTS=false): notifications stay on the edge server,
+// which keeps CLOUD_BRIDGE_RUNNING unset. COMMAND DISPATCH is separate
+// (role.js ownsDispatch): this bridge drains the command outbox every run
+// unless BRIDGE_DISPATCH=false, and the edge — with CLOUD_DISPATCH=true —
+// stands down except during a local failover.
 
 import mqtt from 'mqtt';
 import { hydrate } from '../src/store.js';
-import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus } from '../src/ingest.js';
+import { dispatchPendingCommands } from '../src/dispatch.js';
+import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus, ingestConfig } from '../src/ingest.js';
 import { drainWrites } from '../db/pool.js';
 
 const IDLE_MS   = Number(process.env.COLLECT_IDLE_MS ?? 3000);    // stop after this long with no message
 const MAX_MS    = Number(process.env.COLLECT_MAX_MS ?? 35000);    // hard cap per run
 const CLIENT_ID = process.env.MQTT_CLIENT_ID ?? 'senseable-lambda-bridge';
-const TOPICS    = ['tlm', 'disco', 'ack', 'status'].map((k) => `usc/thesis/+/+/${k}`);
+const TOPICS    = ['tlm', 'disco', 'ack', 'status', 'config'].map((k) => `usc/thesis/+/+/${k}`);
 
 function collect() {
   return new Promise((resolve, reject) => {
@@ -81,12 +85,23 @@ function collect() {
 }
 
 async function ingestOne({ topic, payload, retain }) {
-  // A retained message is a replay of the last one ever published, not a new
-  // reading — the same rule mqtt.js applies on the edge.
-  if (retain) return 'retained';
   let pkt;
   try { pkt = JSON.parse(payload.toString()); } catch { return 'bad-json'; }
+  // The firmware's LWT is just {"t":"lwt","status":…}; its topic always carries
+  // .../{tid}/{nid}/{kind}. Fill what the payload leaves out (src/mqtt.js too).
+  pkt.tid ??= topic.split('/').at(-3);
+  pkt.nid ??= topic.split('/').at(-2);
   const kind = pkt.t === 'lwt' ? 'status' : (pkt.t ?? topic.split('/').pop());
+  // The configuration twin is retained state, delivered on every subscribe; an
+  // unchanged copy writes nothing (ingest.js, ingestConfig).
+  if (kind === 'config') {
+    const c = await ingestConfig(pkt);
+    if (!c.ok) { console.warn(`[bridge] ${topic}: ${c.error}`); return 'rejected'; }
+    return c.changed ? 'config' : 'config-unchanged';
+  }
+  // Any other retained message is a replay of the last one ever published, not
+  // a new reading — the same rule mqtt.js applies on the edge.
+  if (retain) return 'retained';
   let r;
   if (kind === 'tlm')         r = await ingestTelemetry(pkt, { origin: 'cloud' });
   else if (kind === 'disco')  r = await ingestDiscovery(pkt);
@@ -105,16 +120,34 @@ export async function handler() {
 
   const { client, msgs } = await collect();
   const counts = {};
-  for (const m of msgs) {
-    let outcome;
-    try { outcome = await ingestOne(m); }
-    catch (e) { outcome = 'error'; console.error(`[bridge] ${m.topic}: ${e.message}`); }
-    counts[outcome] = (counts[outcome] ?? 0) + 1;
-    // One message's writes land before the next starts. A batch of queued
-    // samples otherwise races its own UPDATEs to ports.last_value, and the
-    // gauge could end on an older reading than the newest one received.
-    await drainWrites();
-  }
+  let next = 0;
+  // Indexed rather than for-of over a snapshot: messages keep arriving while we
+  // work, and each was already PUBACKed, so one left unprocessed is lost.
+  const ingestPending = async () => {
+    for (; next < msgs.length; next += 1) {
+      const m = msgs[next];
+      let outcome;
+      try { outcome = await ingestOne(m); }
+      catch (e) { outcome = 'error'; console.error(`[bridge] ${m.topic}: ${e.message}`); }
+      counts[outcome] = (counts[outcome] ?? 0) + 1;
+      // One message's writes land before the next starts. A batch of queued
+      // samples otherwise races its own UPDATEs to ports.last_value, and the
+      // gauge could end on an older reading than the newest one received.
+      await drainWrites();
+    }
+  };
+  await ingestPending();
+
+  // Cloud-first command delivery, part 2. The Vercel API publishes a command the
+  // moment it is pressed; anything it could not deliver (broker hiccup, pinned
+  // node) is still in the outbox, and this is what sends it — no on-site server
+  // involved. Runs after ingest so pinned nodes' wire tids are known from this
+  // run's packets. Publishes on this run's own connection.
+  counts.dispatched = await dispatchPendingCommands({
+    publish: (topic, payload) => new Promise((resolve) =>
+      client.publish(topic, JSON.stringify(payload), { qos: 1 }, (err) => resolve(!err))),
+  });
+  await ingestPending();               // anything that arrived while dispatching
 
   // end(false): graceful DISCONNECT that keeps the session, so the broker keeps
   // queuing for the next run. QoS 1 acks for everything above were sent as the

@@ -11,7 +11,7 @@
 // "N001" can never write into another tenant's device.
 
 import {
-  store, findNode, findPortByChannel, pushHistory, persistLwt,
+  store, findNode, findPortByChannel, pushHistory, persistLwt, persistWireTid, persistHwConfig,
   applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
   updateCommandStatus, setActuatorAck, addNotification,
 } from './store.js';
@@ -42,7 +42,7 @@ const STRICT_TENANT = process.env.INGEST_STRICT_TENANT !== 'false';
 //   2. store.tenantByMqttTid — the normal tid -> tenants.mqtt_tid path.
 // Both still require a KNOWN mapping, so an unmapped tid on an unpinned node is
 // rejected exactly as before.
-async function resolvePacketNode(pkt) {
+async function resolvePacketNode(pkt, { provision = true } = {}) {
   // CLAIM_ON_CONNECT (claim.js): an unpinned board is claimed by the single
   // organization logged in right now, and the claim becomes its pin. Returns
   // null when the mode is off or the choice is ambiguous, leaving the normal
@@ -58,7 +58,7 @@ async function resolvePacketNode(pkt) {
   // Known tenant + unknown node ⇒ this is a node we've simply never met. Create
   // it rather than dropping its data on the floor. The tenant check above is
   // what keeps this safe: an unmapped tid can never provision anything.
-  if (!node && tenant && AUTO_PROVISION && pkt.nid) {
+  if (!node && tenant && AUTO_PROVISION && provision && pkt.nid) {
     node = await ensureDeviceForTenant(tenant, pkt.nid);
   }
   if (node && claimed) announceClaim(node);
@@ -66,7 +66,8 @@ async function resolvePacketNode(pkt) {
   if (node) {
     // Remember the tid this board really uses, so commands for a pinned node
     // go to the topic it subscribes to rather than its new tenant's tid.
-    if (pkt.tid) node.wireTid = pkt.tid;
+    // Persisted (migration 018) so the cloud API can publish to it directly.
+    if (pkt.tid) persistWireTid(node, pkt.tid);
     return { node, scoped: true, error: null };
   }
 
@@ -475,6 +476,44 @@ export async function ingestStatus(pkt, opts = {}) {
   refreshNodeStatus(node);
 
   return { ok: true, node: node.id, tenantScoped: scoped, presence: raw, lwt: true };
+}
+
+// --- Configuration twin ('config') ------------------------------------------
+// The node publishes its network setup, retained, on usc/thesis/{tid}/{nid}/config:
+//   { t:"config", v:1, tid, nid, active_hw_mode, wifi_ssid, cell_apn,
+//     target_broker, ts }
+// Retained because it is the node's current state, not an event, so unlike
+// tlm/disco/ack a retained copy IS ingested. The broker replays it on every
+// subscribe (each Lambda run), so an unchanged payload writes nothing. It never
+// creates a device: a replay for a board someone deleted must not bring it back.
+const cfgStr = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
+
+export async function ingestConfig(pkt) {
+  if (!pkt || pkt.t !== 'config') return { ok: false, error: 'not a config packet' };
+  const { node, scoped, error } = await resolvePacketNode(pkt, { provision: false });
+  if (error) return { ok: false, error };
+  if (!node) return { ok: true, ignored: `unknown node '${pkt.nid}'` };
+
+  const clock = sampleTime(pkt);
+  const cfg = {
+    mode: cfgStr(pkt.active_hw_mode, 20)?.toUpperCase() ?? null,
+    ssid: cfgStr(pkt.wifi_ssid, 100),
+    apn: cfgStr(pkt.cell_apn, 100),
+    // A broker URI may carry user:password@ — never stored or shown.
+    broker: cfgStr(pkt.target_broker, 255)?.replace(/\/\/[^/@]*@/, '//') ?? null,
+    syncedAt: clock.at.getTime(),
+  };
+  const prev = node.hwConfig;
+  const unchanged = prev && prev.mode === cfg.mode && prev.ssid === cfg.ssid &&
+    prev.apn === cfg.apn && prev.broker === cfg.broker &&
+    // No usable ts: the receive time would differ on every replay, so keep the
+    // first one rather than rewriting the row each minute.
+    (!clock.trusted || prev.syncedAt === cfg.syncedAt);
+  if (unchanged) return { ok: true, node: node.id, tenantScoped: scoped, changed: false };
+
+  node.hwConfig = cfg;
+  persistHwConfig(node).catch((e) => console.error('[ingest] persist config failed:', e.message));
+  return { ok: true, node: node.id, tenantScoped: scoped, changed: true };
 }
 
 // Recompute one node's status from its ports + staleness.

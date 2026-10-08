@@ -44,11 +44,33 @@ export function ownsSideEffects() {
   return route === 'ROUTE_LOCAL_FAILOVER';
 }
 
+// COMMAND DISPATCH has its own owner, separate from notifications, because the
+// two moved to the cloud at different times. Cloud-first: the Vercel API
+// publishes a command the moment it is pressed, and the bridge drains whatever
+// that publish could not deliver. The edge is needed only when the hardware has
+// failed over to the local broker, which the cloud cannot reach.
+//   * bridge: dispatches unless BRIDGE_DISPATCH=false — independent of
+//     BRIDGE_SIDE_EFFECTS, so a data-only Lambda still delivers commands;
+//   * edge with CLOUD_DISPATCH=true (or a full bridge, CLOUD_BRIDGE_RUNNING):
+//     only during local failover, so the two tiers never both publish a row;
+//   * edge with neither: always — the pre-cloud-first behaviour, unchanged.
+// Before this split, a data-only bridge never dispatched and an edge with
+// CLOUD_BRIDGE_RUNNING=true only did during failover, so in that configuration
+// nobody published cloud-authored commands at all.
+export function ownsDispatch() {
+  if (IS_BRIDGE) return process.env.BRIDGE_DISPATCH !== 'false';
+  if (CLOUD_BRIDGE_RUNNING || process.env.CLOUD_DISPATCH === 'true') {
+    return route === 'ROUTE_LOCAL_FAILOVER';
+  }
+  return true;
+}
+
 export function describeRole() {
   return {
     tier: TIER,
     cloudBridgeRunning: IS_BRIDGE ? null : CLOUD_BRIDGE_RUNNING,
     observedRoute: route,
     ownsSideEffects: ownsSideEffects(),
+    ownsDispatch: ownsDispatch(),
   };
 }

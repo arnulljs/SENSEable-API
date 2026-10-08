@@ -26,7 +26,7 @@ import { adminPool } from '../db/pool.js';
 import { publishCommand } from './mqtt.js';
 import { cmdTopic } from './commands.js';
 import { store, commandTidFor } from './store.js';
-import { ownsSideEffects } from './role.js';
+import { ownsDispatch } from './role.js';
 
 // A command that has been sitting in the outbox for longer than this is not
 // dispatched. An actuator instruction authored an hour ago and delivered now is
@@ -43,11 +43,16 @@ export const getDispatchStats = () => ({ ...stats });
 // sweep would otherwise stack passes and send duplicates.
 let running = false;
 
-export async function dispatchPendingCommands() {
+/**
+ * @param opts.publish (topic, payload) => boolean | Promise<boolean>. Defaults to
+ *   this process's broker connections (the edge). The Lambda bridge passes its
+ *   own short-lived client, since it never calls startMqtt().
+ */
+export async function dispatchPendingCommands({ publish = publishCommand } = {}) {
   // Both tiers see the outbox (the bridge directly, the edge via the sync
   // worker's pull). Only the owning tier may publish, or a queued command is
-  // sent to the hardware twice. See role.js.
-  if (!ownsSideEffects()) return 0;
+  // sent to the hardware twice. See ownsDispatch() in role.js.
+  if (!ownsDispatch()) return 0;
   if (running) return 0;
   running = true;
   stats.lastRunAt = Date.now();
@@ -75,6 +80,13 @@ export async function dispatchPendingCommands() {
       // learned from its own packets (dev.wireTid) and differs from the
       // tenant's mqtt_tid; for everything else the two are the same.
       const dev = store.devices.find((d) => d._uuid === row.device_id);
+      // A PINNED node listens on its own tid, which differs from its tenant's
+      // and is known only once the node has been heard (or restored from
+      // devices.wire_tid). Falling back to the tenant's tid here published to a
+      // topic nobody subscribes to and then stamped the row sent — the command
+      // was silently lost. Leave it queued instead; the next pass, after the
+      // node's next packet, delivers it. MAX_AGE_MS still bounds the wait.
+      if (store.tenantByNodeId[row.node_id] && !dev?.wireTid) continue;
       const tid = (dev && commandTidFor(dev)) ?? row.mqtt_tid;
 
       // A node with no known tid cannot be addressed on the wire at all. Treat
@@ -86,7 +98,7 @@ export async function dispatchPendingCommands() {
       // The stored payload IS the frozen-schema envelope, written once by
       // whichever tier accepted the command. Publishing it verbatim keeps a
       // single construction site for the wire format.
-      if (publishCommand(topic, row.payload)) {
+      if (await publish(topic, row.payload)) {
         sent.push(row.command_id);
         console.log(`[dispatch] published ${row.cid} → ${topic}`);
       }

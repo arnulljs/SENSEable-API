@@ -4,6 +4,8 @@
 //   usc/thesis/{tid}/{nid}/tlm     ← telemetry   (subscribe)
 //   usc/thesis/{tid}/{nid}/disco   ← discovery   (subscribe)
 //   usc/thesis/{tid}/{nid}/ack     ← command ack (subscribe)
+//   usc/thesis/{tid}/{nid}/status  ← LWT         (subscribe, retained honoured)
+//   usc/thesis/{tid}/{nid}/config  ← config twin (subscribe, retained honoured)
 //   usc/thesis/{tid}/{nid}/cmd     → commands    (publish)
 //
 // ── CLOUD-FIRST: TWO BROKERS, ONE INGEST PIPELINE ───────────────────────────
@@ -42,7 +44,7 @@
 // either, so "connected but silent" and "connected and working" looked
 // identical. Both are checked and surfaced below, per broker.
 
-import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus } from './ingest.js';
+import { ingestTelemetry, ingestDiscovery, ingestAck, ingestStatus, ingestConfig } from './ingest.js';
 import { broadcastDevices } from './realtime.js';
 import { checkAllPresence } from './presence.js';
 import { TOPIC_BASE } from './commands.js';
@@ -146,9 +148,14 @@ async function route(broker, topic, buf, retained = false) {
   let pkt;
   try { pkt = JSON.parse(buf.toString()); }
   catch { console.warn(`[mqtt:${name}] non-JSON payload on`, topic); return; }
+  // The firmware's LWT is just {"t":"lwt","status":…}; its topic always carries
+  // .../{tid}/{nid}/{kind}. Fill what the payload leaves out (lambda/bridge.mjs too).
+  pkt.tid ??= topic.split('/').at(-3);
+  pkt.nid ??= topic.split('/').at(-2);
 
-  // Prefer the packet's own type; fall back to the topic suffix.
-  const kind = pkt.t ?? topic.split('/').pop();
+  // Prefer the packet's own type; fall back to the topic suffix. The LWT says
+  // t:"lwt" on the status topic (same mapping as lambda/bridge.mjs).
+  const kind = pkt.t === 'lwt' ? 'status' : (pkt.t ?? topic.split('/').pop());
   const bucket = ['tlm', 'disco', 'ack', 'status'].includes(kind) ? kind : 'other';
 
   // RETAINED MESSAGES ARE NOT PRESENCE.
@@ -169,6 +176,14 @@ async function route(broker, topic, buf, retained = false) {
     stats.received.status = (stats.received.status ?? 0) + 1;
     const r = await ingestStatus(pkt, { origin }).catch((e) => ({ ok: false, error: e.message }));
     if (r?.ok) { checkAllPresence(); broadcastDevices(); }
+    else if (r?.error) console.warn(`[mqtt:${name}] ${topic}: ${r.error}`);
+    return;
+  }
+  // The configuration twin is retained state too (ingest.js, ingestConfig).
+  if (kind === 'config') {
+    stats.received.config = (stats.received.config ?? 0) + 1;
+    const r = await ingestConfig(pkt).catch((e) => ({ ok: false, error: e.message }));
+    if (r?.changed) broadcastDevices();
     else if (r?.error) console.warn(`[mqtt:${name}] ${topic}: ${r.error}`);
     return;
   }
@@ -287,6 +302,7 @@ async function connectBroker({ name, url, origin }) {
     `${base}/${tid}/${nid}/disco`,
     `${base}/${tid}/${nid}/ack`,
     `${base}/${tid}/${nid}/status`,   // LWT online/offline (Korinne's contract)
+    `${base}/${tid}/${nid}/config`,   // configuration twin, retained
   ];
 
   client.on('connect', () => {
