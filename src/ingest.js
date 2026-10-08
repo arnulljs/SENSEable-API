@@ -404,8 +404,12 @@ export async function ingestAck(pkt) {
   const status = String(pkt.status ?? '').toLowerCase();
   const terminal = ACK_TERMINAL.has(status);
 
+  // The firmware sends its text as `details` (send_command_ack); `msg` is the
+  // older name, still accepted.
+  const text = pkt.details || pkt.msg || null;
+
   // 1. Update the command record (fire-and-forget persistence).
-  const cmd = await updateCommandStatus(pkt.cid, status, pkt.msg ?? null, terminal, node);
+  const cmd = await updateCommandStatus(pkt.cid, status, text, terminal, node);
 
   // 2. Reflect on the target actuator, if this ack is for an actuate command.
   let actuator = null;
@@ -421,7 +425,7 @@ export async function ingestAck(pkt) {
     addNotification(node, {
       type: 'fault',
       title: `Command ${status}`,
-      message: pkt.msg || `Command ${pkt.cid} (${action ?? 'unknown'}) ${status}.`,
+      message: text || `Command ${pkt.cid} (${action ?? 'unknown'}) ${status}.`,
     }).catch((e) => console.error('[ingest] ack notification failed:', e.message));
   }
 
