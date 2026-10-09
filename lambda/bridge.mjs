@@ -38,9 +38,10 @@ const MAX_MS    = Number(process.env.COLLECT_MAX_MS ?? 35000);    // hard cap pe
 const CLIENT_ID = process.env.MQTT_CLIENT_ID ?? 'senseable-lambda-bridge';
 const TOPICS    = ['tlm', 'disco', 'ack', 'status', 'config'].map((k) => `usc/thesis/+/+/${k}`);
 
-function collect() {
+// Messages land in `msgs` and `onMessage` is called for each, so the handler
+// ingests them while the connection stays open, not in one burst at the end.
+function collect(msgs, onMessage) {
   return new Promise((resolve, reject) => {
-    const msgs = [];
     let idle = null;
     let hard = null;
     let settled = false;
@@ -79,6 +80,7 @@ function collect() {
     client.on('message', (topic, payload, packet) => {
       msgs.push({ topic, payload, retain: packet?.retain === true });
       armIdle();
+      onMessage();
     });
     client.on('error', (err) => finish(err));
   });
@@ -118,7 +120,7 @@ export async function handler() {
   // minute's pins and devices.
   await hydrate({ lite: true });
 
-  const { client, msgs } = await collect();
+  const msgs = [];
   const counts = {};
   let next = 0;
   // Indexed rather than for-of over a snapshot: messages keep arriving while we
@@ -136,6 +138,13 @@ export async function handler() {
       await drainWrites();
     }
   };
+  // LIVE INGEST. Each message is ingested as it arrives (one at a time, in
+  // order), so with a long collection window (COLLECT_MAX_MS ≈ 50 s, see
+  // lambda/README.md) an unplugged board's LWT, or a new reading, reaches the
+  // database within seconds instead of at the end of the run.
+  let chain = Promise.resolve();
+  const { client } = await collect(msgs, () => { chain = chain.then(ingestPending); });
+  await chain;
   await ingestPending();
 
   // Cloud-first command delivery, part 2. The Vercel API publishes a command the
