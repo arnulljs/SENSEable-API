@@ -1073,6 +1073,7 @@ export function projectDevices(tenantId = null) {
           configured: p.configured ?? true,
           enabled: p.enabled !== false,
           disabledReason: p.disabledReason ?? null,
+          formulaLabel: p.formulaLabel ?? null,
         }));
         return {
           id: m.id, address: m.address, name: m.name,
@@ -1118,13 +1119,22 @@ export async function setPortEnabled(dev, moduleId, portId, enabled, reason = nu
   if (!port) { const e = new Error(`unknown port '${portId}'`); e.status = 404; throw e; }
 
   const on = !!enabled;
-  await withTenant(dev._tenantUuid, (c) =>
+  // Switching a channel ON requires a calibration formula: an uncalibrated
+  // channel only shows raw counts, and an empty input's counts look like a
+  // reading. The check is in the UPDATE itself so it reads the formula as the
+  // database has it now (it may have been assigned on the other tier).
+  const { rowCount } = await withTenant(dev._tenantUuid, (c) =>
     c.query(
       `UPDATE ports SET enabled = $2,
               disabled_reason = CASE WHEN $2 THEN NULL ELSE $3 END,
               disabled_at     = CASE WHEN $2 THEN NULL ELSE now() END
-       WHERE port_id = $1`,
+       WHERE port_id = $1 AND (NOT $2 OR formula_id IS NOT NULL)`,
       [port._uuid, on, reason]));
+  if (!rowCount) {
+    const e = new Error(`${port.id} has no calibration formula — assign one on the Calibration page, then enable it`);
+    e.status = 409;
+    throw e;
+  }
 
   port.enabled = on;
   port.disabledReason = on ? null : reason;

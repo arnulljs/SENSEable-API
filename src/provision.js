@@ -199,6 +199,8 @@ export async function ensureModule(dev, addr) {
 }
 
 // ── Ports (ADC channels) ────────────────────────────────────────────────────
+export const NEW_PORT_REASON = 'new channel — assign a calibration formula, then enable';
+
 export async function ensurePort(dev, mod, channel) {
   const ch = Number(channel);
   if (!Number.isInteger(ch) || ch < 0) return null;
@@ -214,16 +216,26 @@ export async function ensurePort(dev, mod, channel) {
     const row = await withTenant(dev._tenantUuid, async (c) => {
       // Descriptive columns are omitted deliberately so the migration-006
       // defaults apply: identity calibration, `raw` units, full ADS1115 span.
+      //
+      // A new channel starts DISABLED. The board has no way to tell an empty
+      // ADS1115 input from a wired one — an unconnected input floats and reads
+      // charge left over from the channel sampled before it — so the first
+      // packet for a channel proves only that the chip exists, not that a sensor
+      // does. The operator commissions the channel by assigning it a calibration
+      // formula and switching it on (setPortEnabled refuses without a formula).
+      // ON CONFLICT leaves an existing row's enabled flag alone.
       const { rows } = await c.query(
         `INSERT INTO ports (port_id, module_id, tenant_id, port_code, port_index,
-                            active_flag, first_seen, last_seen)
-         VALUES (senseable_uuid('port', $1::text, $3), $1::uuid, $2::uuid, $3, $4, true, now(), now())
+                            active_flag, first_seen, last_seen,
+                            enabled, disabled_reason, disabled_at)
+         VALUES (senseable_uuid('port', $1::text, $3), $1::uuid, $2::uuid, $3, $4, true, now(), now(),
+                 false, $5, now())
          ON CONFLICT (module_id, port_code) DO UPDATE SET last_seen = now()
          RETURNING port_id, port_code, port_index, label, unit,
                    range_min, range_max, safe_min, safe_max,
                    cal_type, cal_slope, cal_offset, active_flag,
-                   last_value, last_status, configured`,
-        [mod._uuid, dev._tenantUuid, code, ch]);
+                   last_value, last_status, configured, enabled, disabled_reason`,
+        [mod._uuid, dev._tenantUuid, code, ch, NEW_PORT_REASON]);
       return rows[0];
     });
 
@@ -243,6 +255,8 @@ export async function ensurePort(dev, mod, channel) {
         ? { type: 'expr', expr: null }
         : { type: 'linear', slope: row.cal_slope, offset: row.cal_offset },
       formulaLabel: null,
+      enabled: row.enabled !== false,
+      disabledReason: row.disabled_reason ?? null,
       value: row.last_value,
       code: 0,
       status: row.last_status ?? 'Offline',
