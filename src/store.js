@@ -63,7 +63,6 @@ export const store = {
   devices: [],            // hydrated device tree (frontend shape + internal uuids)
   notifications: [],
   savedFormulas: [],
-  channelAssignments: {},
   sensorProfiles: [],
   mapSensors: [],
   commands: [],           // recent downward commands, keyed by cid (cmd↔ack)
@@ -125,7 +124,7 @@ export async function hydrate({ lite = false } = {}) {
       p.active_flag, p.cal_type, p.cal_slope, p.cal_offset,
       p.last_value, p.last_status, p.last_seen AS port_last_seen,
       p.configured AS port_configured, p.enabled AS port_enabled,
-      p.disabled_reason,
+      p.disabled_reason, p.conn_state,
       f.label AS formula_label, f.expression AS formula_expr
     FROM devices d
     JOIN tenants t ON t.tenant_id = d.tenant_id
@@ -201,7 +200,7 @@ export async function hydrate({ lite = false } = {}) {
       value: r.last_value,
       code: 0,
       status: r.last_status ?? 'Offline',
-      connState: r.active_flag ? 'CONNECTED' : 'DISCONNECTED',
+      connState: r.conn_state ?? (r.active_flag ? 'CONNECTED' : 'DISCONNECTED'),
       masked: false,
       // Restored from the DB rather than reset to null, so "last seen" is real
       // across restarts. Staleness still forces Offline until fresh telemetry.
@@ -276,7 +275,6 @@ export async function hydrate({ lite = false } = {}) {
     safeMin: p.safe_min, safeMax: p.safe_max,
   }));
 
-  rebuildChannelAssignments();
   await loadMapSensors();
   await loadCommands();
 
@@ -386,17 +384,6 @@ async function loadCommandForNode(cid, node) {
   return rec;
 }
 
-// channelAssignments is a derived view over ports.formula_id, keyed by module.
-function rebuildChannelAssignments() {
-  const out = {};
-  for (const d of store.devices) {
-    for (const m of d.modules) {
-      out[m.id] ??= {};
-      for (const p of m.ports) out[m.id][p.id] = p.formulaLabel ?? null;
-    }
-  }
-  store.channelAssignments = out;
-}
 
 // ── Lookups (same signatures the old store exported) ────────────────────────
 export function findNode(nid) {
@@ -568,11 +555,12 @@ function deviceOfPort(port) {
 }
 
 // Persist a port's discovery-derived active_flag (fire-and-forget).
-export async function persistPortActive(port, attached) {
+export async function persistPortActive(port, attached, connState = null) {
   const dev = deviceOfPort(port);
   if (!dev) return;
   await withTenant(dev._tenantUuid, (c) =>
-    c.query(`UPDATE ports SET active_flag=$2 WHERE port_id=$1`, [port._uuid, attached]));
+    c.query(`UPDATE ports SET active_flag=$2, conn_state=coalesce($3, conn_state) WHERE port_id=$1`,
+            [port._uuid, attached, connState]));
 }
 
 // ── Renames (write-through, RLS-enforced) ───────────────────────────────────
@@ -798,30 +786,33 @@ export async function deleteFormula(id) {
     c.query(`DELETE FROM calibration_formulas WHERE formula_id=$1`, [id]));
 
   store.savedFormulas = store.savedFormulas.filter((x) => String(x.id) !== String(id));
-  for (const d of store.devices)
+  // Only this tenant's ports: another organization may have a formula with the
+  // same label, and its channels keep theirs.
+  for (const d of store.devices.filter((x) => x.tenantId === f.tenantId))
     for (const m of d.modules)
       for (const p of m.ports)
         if (p.formulaLabel === f.label) {
           p.formulaLabel = null;
           p.calibration = { type: 'linear', slope: 1, offset: 0 };
         }
-  rebuildChannelAssignments();
   return 1;
 }
 
-export async function assignChannel(moduleId, portCode, formulaLabel) {
-  let target = null, dev = null;
-  for (const d of store.devices)
-    for (const m of d.modules)
-      if (m.id === moduleId)
-        for (const p of m.ports)
-          if (p.id === portCode) { target = p; dev = d; }
-  if (!target) throw new Error(`unknown channel ${moduleId}/${portCode}`);
+// Assign (or clear, with a null label) the calibration formula of ONE port.
+// The port is addressed through its device: a board address alone is not
+// unique — every ADS1115 defaults to 0x48 — and the old address-only lookup
+// wrote to whichever node, in whichever tenant, it found last.
+export async function assignPortFormula(dev, moduleId, portCode, formulaLabel) {
+  const notFound = (msg) => Object.assign(new Error(msg), { status: 404 });
+  const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
+  const target = mod?.ports.find((p) => p.id === portCode || p._uuid === portCode);
+  if (!target) throw notFound(`unknown channel ${moduleId}/${portCode} on ${dev.id}`);
 
   const f = formulaLabel
     ? store.savedFormulas.find(
         (x) => x.label === formulaLabel && x.tenantId === dev.tenantId)
     : null;
+  if (formulaLabel && !f) throw notFound(`unknown formula '${formulaLabel}'`);
 
   await withTenant(dev._tenantUuid, (c) =>
     c.query(
@@ -833,8 +824,7 @@ export async function assignChannel(moduleId, portCode, formulaLabel) {
   target.calibration = f
     ? { type: 'expr', expr: f.formula }
     : { type: 'linear', slope: 1, offset: 0 };
-  rebuildChannelAssignments();
-  return store.channelAssignments[moduleId];
+  return { formulaLabel: target.formulaLabel };
 }
 
 export async function saveMapSensors(sensors) {
@@ -952,7 +942,6 @@ export async function refreshConfig() {
       }
     }
   }
-  rebuildChannelAssignments();
 }
 
 // ── NODE-TENANT-OVERRIDE: node tenant assignments (migration 011) ───────────

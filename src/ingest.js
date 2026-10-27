@@ -317,22 +317,25 @@ export async function ingestDiscovery(pkt) {
     for (const [key, state] of Object.entries(bus.ports ?? {})) {
       const ch = Number(String(key).replace(/^p/i, ''));   // 'p2' -> 2
       let port = mod.ports.find((p) => p.channel === ch);
-      // Discovery enumerates every channel on the chip, including empty ones.
-      // Only provision channels the firmware says something is attached to —
-      // otherwise every node would sprout four ports whether wired or not.
-      if (!port && AUTO_PROVISION && String(state).toUpperCase() === 'CONNECTED') {
+      const conn = describeConnState(state);
+      // Every channel the node reports is created, whatever its state. The
+      // firmware keeps ports switched off until an operator turns them on, and a
+      // switched-off port is left out of telemetry — so discovery is the only
+      // place it ever appears. New channels start disabled (provision.js), so
+      // this adds switches for the operator, not readings. CONNECTED means
+      // "readable", not "a sensor is attached": the node cannot tell.
+      if (!port && AUTO_PROVISION && conn.name !== 'UNKNOWN') {
         port = await ensurePort(node, mod, ch);
         if (port) provisioned++;
       }
       if (!port) { unmatched++; continue; }
 
-      const conn = describeConnState(state);
-      port.connState = conn.name;
       port.masked = conn.masked;
-      if (port.activeFlag !== conn.attached) {
+      if (port.activeFlag !== conn.attached || port.connState !== conn.name) {
         port.activeFlag = conn.attached;
-        persistPortActive(port, conn.attached).catch((e) =>
-          console.error('[ingest] persist active_flag failed:', e.message));
+        port.connState = conn.name;
+        persistPortActive(port, conn.attached, conn.name).catch((e) =>
+          console.error('[ingest] persist port state failed:', e.message));
       }
 
       if (conn.name === 'CONNECTED') connected++;
@@ -385,10 +388,10 @@ export async function ingestDiscovery(pkt) {
 //
 // status ∈ started | completed | stopped | failed | error | success
 const ACK_OK       = new Set(['started', 'completed', 'stopped', 'success']);
-const ACK_FAIL     = new Set(['failed', 'error']);
+const ACK_FAIL     = new Set(['failed', 'error', 'expired']);
 // A command reaches a terminal state on these; actuator returns to ground on
 // completed/stopped (the timer elapsed or a manual stop overrode it).
-const ACK_TERMINAL = new Set(['completed', 'stopped', 'success', 'failed', 'error']);
+const ACK_TERMINAL = new Set(['completed', 'stopped', 'success', 'failed', 'error', 'expired']);
 const ACK_GROUNDED = new Set(['completed', 'stopped']);
 
 export async function ingestAck(pkt) {
@@ -401,12 +404,16 @@ export async function ingestAck(pkt) {
 
   node.lastSeen = Date.now();
 
-  const status = String(pkt.status ?? '').toLowerCase();
-  const terminal = ACK_TERMINAL.has(status);
-
   // The firmware sends its text as `details` (send_command_ack); `msg` is the
   // older name, still accepted.
   const text = pkt.details || pkt.msg || null;
+
+  // failed + "expired": the node refused a command more than 5 minutes old, on
+  // purpose. Recorded as its own status ('expired' is in the actuator_ack enum)
+  // so the dashboard can say "try again" instead of a generic failure.
+  let status = String(pkt.status ?? '').toLowerCase();
+  if (status === 'failed' && /expired/i.test(text ?? '')) status = 'expired';
+  const terminal = ACK_TERMINAL.has(status);
 
   // 1. Update the command record (fire-and-forget persistence).
   const cmd = await updateCommandStatus(pkt.cid, status, text, terminal, node);
@@ -425,7 +432,10 @@ export async function ingestAck(pkt) {
     addNotification(node, {
       type: 'fault',
       title: `Command ${status}`,
-      message: text || `Command ${pkt.cid} (${action ?? 'unknown'}) ${status}.`,
+      message: status === 'expired'
+        ? `Command expired — ${action ?? 'it'} was more than 5 minutes old when ${node.nodeId} received it, ` +
+          'so the node ignored it. Please try again.'
+        : text || `Command ${pkt.cid} (${action ?? 'unknown'}) ${status}.`,
     }).catch((e) => console.error('[ingest] ack notification failed:', e.message));
   }
 

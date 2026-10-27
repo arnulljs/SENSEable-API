@@ -17,7 +17,7 @@ import { Router } from 'express';
 import {
   store, projectDevices,
   markNotificationRead, markAllNotificationsRead,
-  createFormula, deleteFormula, assignChannel, saveMapSensors,
+  createFormula, deleteFormula, assignPortFormula, saveMapSensors,
   findNode, recordCommand, applyActuatorCommand,
   renameDevice, renameModule, renameActuator,
   removeDevice, removeModule, removePort, setPortEnabled,
@@ -120,14 +120,6 @@ router.post('/formulas/fit', (req, res) => {
   res.json(fit);
 });
 
-router.get('/channel-assignments', (_req, res) => res.json(store.channelAssignments));
-
-router.put('/channel-assignments/:board/:channel', wrap(async (req, res) => {
-  const { board, channel } = req.params;
-  const { formulaLabel } = req.body ?? {};
-  const updated = await assignChannel(board, channel, formulaLabel ?? null);
-  res.json(updated);
-}));
 
 router.get('/map-sensors', (_req, res) => res.json(store.mapSensors));
 
@@ -193,6 +185,24 @@ router.patch('/devices/:deviceId/actuators/:actuatorId', wrap(async (req, res) =
   }
   res.json({ ok: true, device: projectOne(dev) });
 }));
+
+// --- Channel calibration formula ----------------------------------------------
+// PUT { formulaLabel: string | null }
+// One port, addressed through its device. Replaces the old
+// /channel-assignments/:board/:channel, which named only a board address —
+// shared by every node with an ADS1115 at 0x48 — and wrote to an arbitrary one.
+router.put('/devices/:deviceId/modules/:moduleId/ports/:portId/formula',
+  wrap(async (req, res) => {
+    const dev = resolveDevice(req, res);
+    if (!dev) return;
+    try {
+      const r = await assignPortFormula(dev, req.params.moduleId, req.params.portId,
+                                        req.body?.formulaLabel ?? null);
+      res.json({ ok: true, ...r, device: projectOne(dev) });
+    } catch (e) {
+      res.status(e.status ?? 400).json({ error: e.message });
+    }
+  }));
 
 // --- Channel enable / disable ------------------------------------------------
 // PATCH { enabled: bool, reason?: string }

@@ -39,7 +39,7 @@ checks + staleness into the UI's `Normal | Warning | Fault | Offline` states.
 | GET/POST | `/api/notifications`, `/notifications/read-all` | Notifications |
 | GET/POST/DELETE | `/api/formulas` | Calibration formula bank |
 | POST | `/api/formulas/fit` | Least-squares fit from `{raw,value}` points |
-| GET/PUT | `/api/channel-assignments/...` | Per-board channel→formula map |
+| PUT | `/api/devices/:deviceId/modules/:moduleId/ports/:portId/formula` | Assign a port's calibration formula (`{ formulaLabel }`, `null` clears); the formula appears as `formulaLabel` on each port in `/api/devices` |
 | GET/PUT | `/api/map-sensors` | Interactive-map sensor placements |
 | POST | `/api/ingest/telemetry` | Ingest a `tlm` payload (broker-free) |
 | POST | `/api/ingest/discovery` | Ingest a `dsc` payload (broker-free) |
