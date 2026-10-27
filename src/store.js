@@ -200,7 +200,8 @@ export async function hydrate({ lite = false } = {}) {
       value: r.last_value,
       code: 0,
       status: r.last_status ?? 'Offline',
-      connState: r.conn_state ?? (r.active_flag ? 'CONNECTED' : 'DISCONNECTED'),
+      // The node's last discovery report (migration 022); null until it sends one.
+      connState: r.conn_state ?? null,
       masked: false,
       // Restored from the DB rather than reset to null, so "last seen" is real
       // across restarts. Staleness still forces Offline until fresh telemetry.
