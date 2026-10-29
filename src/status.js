@@ -9,15 +9,19 @@
 //
 //   0  NORMAL            healthy analog reading
 //   1  OPEN              floating pin / empty terminal (4500..5000 LSB window)
-//   2  FAULT_OOR         voltage saturated the ADC registers (±32760)
-//   3  HARDWARE_OFFLINE  I2C line fault / comm drop (node reports -9999)
+//   2  SATURATED         at least one sample in the window hit the ADC limit
+//                        (±32760). Since firmware 2026-10-28 a row is a window
+//                        average, so this is "clipped at some point", not a
+//                        broken sensor: a warning (amber), not a fault.
+//   3  READ_FAILED       every read in the window failed (I2C fault, node
+//                        reports -9999): a fault (red).
 //
 // --- Frozen telemetry status codes (adc[].p[] third element) ----------------
 const SCHEMA_CODES = {
   0: { name: 'NORMAL',           severity: 'normal'  },
   1: { name: 'OPEN',             severity: 'offline' }, // unplugged / floating
-  2: { name: 'FAULT_OOR',        severity: 'fault'   }, // ADC saturation
-  3: { name: 'HARDWARE_OFFLINE', severity: 'offline' }, // I2C fault (-9999)
+  2: { name: 'SATURATED',        severity: 'warning' }, // clipped during the window
+  3: { name: 'READ_FAILED',      severity: 'fault'   }, // every read failed (-9999)
 };
 
 function describeCode(code) {
@@ -79,11 +83,13 @@ const UI_TO_DEVICE = { Offline: 'offline', Fault: 'fault', Warning: 'warning', N
 // so it deserves its own indicator rather than inheriting the node's.
 //
 // Disabled channels are excluded: switching off an unwired input must not make
-// the board it sits on look degraded.
+// the board it sits on look degraded. A board that is reporting with every
+// channel off is ONLINE — the board and its channels are separate parts, and
+// telling them apart is what makes a fault findable.
 export function deriveModuleStatus({ portStatuses, lastSeen, now = Date.now(), staleMs = STALE_MS }) {
   if (lastSeen == null || now - lastSeen > staleMs) return 'offline';
   const considered = portStatuses.filter((s) => s !== 'Disabled');
-  if (!considered.length) return 'offline';   // board present but nothing monitored
+  if (!considered.length) return 'online';    // board present, nothing switched on
 
   let worst = 'Normal';
   for (const s of considered) {

@@ -116,6 +116,7 @@ export async function hydrate({ lite = false } = {}) {
       d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms, d.lwt_online,
       d.wire_tid,
       d.active_hw_mode, d.wifi_ssid, d.cell_apn, d.target_broker, d.last_config_sync,
+      d.last_reset, d.last_crash_step, d.last_crash_task, d.prev_uptime_s,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
       m.last_seen AS module_last_seen, m.configured AS module_configured,
@@ -124,7 +125,7 @@ export async function hydrate({ lite = false } = {}) {
       p.active_flag, p.cal_type, p.cal_slope, p.cal_offset,
       p.last_value, p.last_status, p.last_seen AS port_last_seen,
       p.configured AS port_configured, p.enabled AS port_enabled,
-      p.disabled_reason, p.conn_state,
+      p.disabled_reason, p.conn_state, p.last_code,
       f.label AS formula_label, f.expression AS formula_expr
     FROM devices d
     JOIN tenants t ON t.tenant_id = d.tenant_id
@@ -162,6 +163,8 @@ export async function hydrate({ lite = false } = {}) {
         hwConfig: r.last_config_sync ? {
           mode: r.active_hw_mode, ssid: r.wifi_ssid, apn: r.cell_apn,
           broker: r.target_broker, syncedAt: new Date(r.last_config_sync).getTime(),
+          reset: r.last_reset ?? null, crashStep: r.last_crash_step ?? null,
+          crashTask: r.last_crash_task ?? null, prevUptimeS: r.prev_uptime_s ?? null,
         } : null,
         systemFault: 0,
         lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
@@ -198,7 +201,7 @@ export async function hydrate({ lite = false } = {}) {
         : { type: 'linear', slope: r.cal_slope, offset: r.cal_offset },
       formulaLabel: r.formula_label ?? null,
       value: r.last_value,
-      code: 0,
+      code: r.last_code ?? 0,
       status: r.last_status ?? 'Offline',
       // The node's last discovery report (migration 022); null until it sends one.
       connState: r.conn_state ?? null,
@@ -289,8 +292,8 @@ export async function hydrate({ lite = false } = {}) {
 
 async function loadHistory() {
   const { rows } = await adminPool.query(`
-    SELECT port_id, ts, value, status, origin FROM (
-      SELECT port_id, ts, value, status, origin,
+    SELECT port_id, ts, value, status, origin, code, n, win_ms, value_min, value_max FROM (
+      SELECT port_id, ts, value, status, origin, code, n, win_ms, value_min, value_max,
              row_number() OVER (PARTITION BY port_id ORDER BY ts DESC) AS rn
       FROM readings
     ) x WHERE rn <= $1 ORDER BY ts ASC`, [HISTORY_CAP]);
@@ -303,6 +306,7 @@ async function loadHistory() {
     byPort.get(r.port_id).push({
       timestamp: fmtTs(new Date(r.ts)), value: r.value, status: r.status,
       source: r.origin ?? 'cloud',
+      ...historyStats({ code: r.code, n: r.n, winMs: r.win_ms, valueMin: r.value_min, valueMax: r.value_max }),
     });
   }
   for (const d of store.devices)
@@ -432,15 +436,18 @@ export function findPortByChannel(node, moduleAddress, channelIndex) {
 export function pushHistory(port, value, status, opts = {}) {
   const at = opts.ts instanceof Date ? opts.ts : new Date();
 
+  const st = opts.stats ?? {};
   if (!opts.replay) {
-    port.history.push({ timestamp: fmtTs(at), value, status, source: opts.origin ?? 'cloud' });
+    port.history.push({
+      timestamp: fmtTs(at), value, status, source: opts.origin ?? 'cloud', ...historyStats(st),
+    });
     if (port.history.length > HISTORY_CAP) {
       port.history.splice(0, port.history.length - HISTORY_CAP);
     }
   }
 
   persistReading(port, value, status, at, opts.origin ?? 'cloud', opts.replay === true,
-                 opts.raw ?? port.raw ?? 0, opts.net ?? null)
+                 opts.raw ?? port.raw ?? 0, opts.net ?? null, st)
     .catch((e) => console.error('[store] persist reading failed:', e.message));
 }
 
@@ -467,7 +474,14 @@ const IS_CLOUD_TIER = process.env.TIER === 'cloud';
 // paying twice for every reading is not a steady state.
 const EDGE_BRIDGES_CLOUD = process.env.EDGE_BRIDGES_CLOUD === 'true';
 
-async function persistReading(port, value, status, at, origin, replay = false, raw = 0, net = null) {
+// The window statistics the dashboard shows next to a reading (migration 024).
+// Same shape on both tiers (web api/_read.js attachHistory).
+export function historyStats(st) {
+  return { code: st.code ?? null, n: st.n ?? null, winMs: st.winMs ?? null,
+           min: st.valueMin ?? null, max: st.valueMax ?? null };
+}
+
+async function persistReading(port, value, status, at, origin, replay = false, raw = 0, net = null, st = {}) {
   const dev = deviceOfPort(port);
   if (!dev) return;
   // A 'cloud'-origin row on the edge is a MIRROR of something the cloud already
@@ -476,17 +490,20 @@ async function persistReading(port, value, status, at, origin, replay = false, r
   const synced = IS_CLOUD_TIER || (origin === 'cloud' && !EDGE_BRIDGES_CLOUD);
   await withTenant(dev._tenantUuid, async (c) => {
     await c.query(
-      `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced, network_type)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+      `INSERT INTO readings(port_id, tenant_id, ts, raw_adc, value, status, origin, synced, network_type,
+                            code, n, win_ms, raw_min, raw_max, value_min, value_max)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        ON CONFLICT (port_id, ts) DO NOTHING`,
-      [port._uuid, dev._tenantUuid, at, raw, value, status, origin, synced, net]
+      [port._uuid, dev._tenantUuid, at, raw, value, status, origin, synced, net,
+       st.code ?? null, st.n ?? null, st.winMs ?? null, st.rawMin ?? null, st.rawMax ?? null,
+       st.valueMin ?? null, st.valueMax ?? null]
     );
     // A replayed sample is history. Letting it write last_value would make the
     // dashboard show an outage-era reading as the current one.
     if (!replay) {
       await c.query(
-        `UPDATE ports SET last_value=$2, last_status=$3 WHERE port_id=$1`,
-        [port._uuid, value, status]
+        `UPDATE ports SET last_value=coalesce($2, last_value), last_status=$3, last_code=$4 WHERE port_id=$1`,
+        [port._uuid, value, status, st.code ?? null]
       );
     }
   });
@@ -525,9 +542,11 @@ export async function persistHwConfig(dev) {
   await withTenant(dev._tenantUuid, (q) =>
     q.query(
       `UPDATE devices SET active_hw_mode=$2, wifi_ssid=$3, cell_apn=$4, target_broker=$5,
-              last_config_sync=to_timestamp($6/1000.0)
+              last_config_sync=to_timestamp($6/1000.0),
+              last_reset=$7, last_crash_step=$8, last_crash_task=$9, prev_uptime_s=$10
        WHERE device_id=$1`,
-      [dev._uuid, c.mode, c.ssid, c.apn, c.broker, c.syncedAt]));
+      [dev._uuid, c.mode, c.ssid, c.apn, c.broker, c.syncedAt,
+       c.reset ?? null, c.crashStep ?? null, c.crashTask ?? null, c.prevUptimeS ?? null]));
 }
 
 export async function persistLwt(dev, online) {
@@ -1067,6 +1086,7 @@ export function projectDevices(tenantId = null) {
           enabled: p.enabled !== false,
           disabledReason: p.disabledReason ?? null,
           formulaLabel: p.formulaLabel ?? null,
+          code: p.code ?? null,   // latest window's status code (2 = saturated)
         }));
         return {
           id: m.id, address: m.address, name: m.name,

@@ -145,6 +145,32 @@ function warnClockOnce(nid, raw) {
                'probably unset. Live samples use server time; replayed samples are dropped.');
 }
 
+// One port's window statistics (firmware 2026-10-28): a port row is
+// [ch, mean, status, n, min, max] over win_ms, sampled once a second. Older
+// firmware sends [ch, raw, status]; the extra fields are then null. A row whose
+// every read failed is [ch, -9999, 3, 0, -9999, -9999]: it has no value at all —
+// calibrating -9999 would put a made-up number on the chart.
+const READ_FAILED = -9999;
+const intOrNull = (v) => (Number.isInteger(v) ? v : null);
+function windowStats(port, [, raw, code, n, rawMin, rawMax], winMs) {
+  const failed = raw === READ_FAILED || code === 3;
+  const value = failed ? null : applyCalibration(raw, port.calibration);
+  const hasRange = !failed && Number.isInteger(rawMin) && Number.isInteger(rawMax) &&
+                   rawMin !== READ_FAILED && rawMax !== READ_FAILED;
+  const a = hasRange ? applyCalibration(rawMin, port.calibration) : null;
+  const b = hasRange ? applyCalibration(rawMax, port.calibration) : null;
+  const ok = a != null && b != null;
+  return {
+    value,
+    stats: {
+      code: intOrNull(code), n: intOrNull(n),
+      winMs: Number.isFinite(Number(winMs)) && winMs !== null ? Math.round(Number(winMs)) : null,
+      rawMin: hasRange ? rawMin : null, rawMax: hasRange ? rawMax : null,
+      valueMin: ok ? Math.min(a, b) : null, valueMax: ok ? Math.max(a, b) : null,
+    },
+  };
+}
+
 // --- Telemetry ('tlm') ------------------------------------------------------
 /**
  * @param opts.origin 'cloud' (packet came over the cloud broker — the normal
@@ -202,7 +228,14 @@ export async function ingestTelemetry(pkt, opts = {}) {
     if (!mod && AUTO_PROVISION) { mod = await ensureModule(node, addr); if (mod) provisioned++; }
     if (!mod) { unmatched += (module.p ?? []).length; continue; }
 
-    for (const [channel, raw, code] of module.p ?? []) {
+    // The board itself is present: the firmware lists every chip it can reach,
+    // with an empty `p` when none of its channels are switched on. Touching
+    // presence only per channel made a board with every channel off look
+    // unplugged.
+    touchPresence(node, mod, null);
+
+    for (const row of module.p ?? []) {
+      const [channel, raw, code] = row;
       let port = mod.ports.find((p) => p.channel === Number(channel));
       if (!port && AUTO_PROVISION) { port = await ensurePort(node, mod, channel); if (port) provisioned++; }
       if (!port) { unmatched++; continue; }
@@ -227,7 +260,9 @@ export async function ingestTelemetry(pkt, opts = {}) {
       port.lastSeen = now;
 
       // All engineering-unit conversion happens HERE, server-side.
-      const value = applyCalibration(raw, port.calibration);
+      const { value, stats } = windowStats(port, row, pkt.win_ms);
+      // A failed window keeps the gauge on the last good value (its status says
+      // the read failed); the reading itself is stored without a value.
       if (value != null) port.value = value;
 
       port.status = derivePortStatus({
@@ -236,7 +271,7 @@ export async function ingestTelemetry(pkt, opts = {}) {
         lastSeen: port.lastSeen, now,
       });
 
-      pushHistory(port, port.value, port.status, { origin, ts, net }); // → INSERT INTO readings
+      pushHistory(port, value, port.status, { origin, ts, net, stats }); // → INSERT INTO readings
       matched++;
     }
   }
@@ -261,14 +296,15 @@ async function ingestReplay(node, pkt, { origin, clock, scoped, net }) {
     if (!mod && AUTO_PROVISION) { mod = await ensureModule(node, addr); if (mod) provisioned++; }
     if (!mod) { unmatched += (module.p ?? []).length; continue; }
 
-    for (const [channel, raw, code] of module.p ?? []) {
+    for (const row of module.p ?? []) {
+      const [channel, raw, code] = row;
       let port = mod.ports.find((p) => p.channel === Number(channel));
       if (!port && AUTO_PROVISION) { port = await ensurePort(node, mod, channel); if (port) provisioned++; }
       if (!port) { unmatched++; continue; }
       if (port.enabled === false) { skipped++; continue; }
       if (!clock.trusted) { undatable++; continue; }
 
-      const value = applyCalibration(raw, port.calibration);
+      const { value, stats } = windowStats(port, row, pkt.win_ms);
       // Judged as of its own moment, so a buffered sample is not filed as
       // Offline merely for being old.
       const status = derivePortStatus({
@@ -278,7 +314,7 @@ async function ingestReplay(node, pkt, { origin, clock, scoped, net }) {
       });
       // A replay is history: it records the network each sample came in on,
       // but never changes the device's current interface.
-      pushHistory(port, value, status, { origin, ts: clock.at, replay: true, raw, net });
+      pushHistory(port, value, status, { origin, ts: clock.at, replay: true, raw, net, stats });
       stored++;
     }
   }
@@ -525,11 +561,21 @@ export async function ingestConfig(pkt) {
     apn: cfgStr(pkt.cell_apn, 100),
     // A broker URI may carry user:password@ — never stored or shown.
     broker: cfgStr(pkt.target_broker, 255)?.replace(/\/\/[^/@]*@/, '//') ?? null,
+    // Why this boot started; after a crash also where the previous one was
+    // (last_step/last_task) and how long it had run. Absent fields clear the
+    // previous crash: the config describes the current boot.
+    reset: cfgStr(pkt.last_reset, 30)?.toLowerCase() ?? null,
+    crashStep: cfgStr(pkt.last_step, 80),
+    crashTask: cfgStr(pkt.last_task, 40),
+    prevUptimeS: Number.isFinite(Number(pkt.prev_uptime_s)) && pkt.prev_uptime_s !== null
+      ? Number(pkt.prev_uptime_s) : null,
     syncedAt: clock.at.getTime(),
   };
   const prev = node.hwConfig;
   const unchanged = prev && prev.mode === cfg.mode && prev.ssid === cfg.ssid &&
     prev.apn === cfg.apn && prev.broker === cfg.broker &&
+    prev.reset === cfg.reset && prev.crashStep === cfg.crashStep &&
+    prev.crashTask === cfg.crashTask && prev.prevUptimeS === cfg.prevUptimeS &&
     // No usable ts: the receive time would differ on every replay, so keep the
     // first one rather than rewriting the row each minute.
     (!clock.trusted || prev.syncedAt === cfg.syncedAt);
