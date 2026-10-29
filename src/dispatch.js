@@ -32,7 +32,10 @@ import { ownsDispatch } from './role.js';
 // dispatched. An actuator instruction authored an hour ago and delivered now is
 // worse than one never delivered: the operator has moved on, and the tank has
 // not. Expired rows are marked so they stop being scanned.
-const MAX_AGE_MS = Number(process.env.COMMAND_MAX_AGE_MS ?? 10 * 60_000);
+// The node itself refuses any command whose ts is more than 300 s old (ACK
+// failed "Command expired"), so delivering an older one only produces that
+// failure. 270 s leaves 30 s for the publish to reach the node.
+const MAX_AGE_MS = Number(process.env.COMMAND_MAX_AGE_MS ?? 270_000);
 const BATCH = Number(process.env.COMMAND_DISPATCH_BATCH ?? 50);
 
 const stats = { dispatched: 0, expired: 0, failed: 0, lastRunAt: null, lastError: null };

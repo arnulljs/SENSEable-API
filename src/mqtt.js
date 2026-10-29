@@ -145,6 +145,9 @@ const retainedLogged = new Set();
 
 async function route(broker, topic, buf, retained = false) {
   const { stats, origin, name } = broker;
+  // Empty payload = a retained topic being cleared (the node does this to its
+  // old tenant's disco/config on a tenant change). Nothing to ingest.
+  if (!buf.length) return;
   let pkt;
   try { pkt = JSON.parse(buf.toString()); }
   catch { console.warn(`[mqtt:${name}] non-JSON payload on`, topic); return; }

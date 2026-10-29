@@ -1026,15 +1026,17 @@ export function commandTidFor(dev) {
 // the ONLY thing that gates deletion: you may remove hardware that has gone
 // quiet, never hardware that is live. Exposing it per entity lets the UI show or
 // hide each remove button without a second round-trip.
-const isPortActive   = (p, now = Date.now()) => p.lastSeen != null && now - p.lastSeen <= STALE_MS;
-const isModuleActive = (m, now = Date.now()) =>
-  (m.lastSeen != null && now - m.lastSeen <= STALE_MS) || m.ports.some((p) => isPortActive(p, now));
+// `ms` is the node's own window (staleMsFor: 3 × its tlm_interval_ms), so a node
+// on a 15-minute interval is not "inactive" — and removable — between rows.
+const isPortActive   = (p, now = Date.now(), ms = STALE_MS) => p.lastSeen != null && now - p.lastSeen <= ms;
+const isModuleActive = (m, now = Date.now(), ms = STALE_MS) =>
+  (m.lastSeen != null && now - m.lastSeen <= ms) || m.ports.some((p) => isPortActive(p, now, ms));
 // A node the broker reported OFFLINE via LWT is not active, even if its last
 // telemetry is still inside the staleness window — the LWT is proof the socket
 // dropped. lwtOnline === true / undefined leaves the staleness check in charge.
-const isDeviceActive = (d, now = Date.now()) =>
+const isDeviceActive = (d, now = Date.now(), ms = staleMsFor(d, STALE_MS)) =>
   d.lwtOnline !== false &&
-  ((d.lastSeen != null && now - d.lastSeen <= STALE_MS) || d.modules.some((m) => isModuleActive(m, now)));
+  ((d.lastSeen != null && now - d.lastSeen <= ms) || d.modules.some((m) => isModuleActive(m, now, ms)));
 
 export function projectDevices(tenantId = null) {
   const now = Date.now();
@@ -1046,6 +1048,7 @@ export function projectDevices(tenantId = null) {
       uptime: d.uptime, rssi: d.rssi, freeHeap: d.freeHeap,
       lastSeen: d.lastSeen ?? null,
       hwConfig: d.hwConfig ?? null,
+      tlmIntervalMs: d.tlmIntervalMs ?? null,   // live value from disco
       active: isDeviceActive(d, now),
       configured: d.configured ?? true,
       modules: d.modules.map((m) => {
@@ -1059,7 +1062,7 @@ export function projectDevices(tenantId = null) {
           history: p.history,
           activeFlag: p.activeFlag, connState: p.connState ?? null, masked: !!p.masked,
           lastSeen: p.lastSeen ?? null,
-          active: isPortActive(p, now),
+          active: isPortActive(p, now, staleMsFor(d, STALE_MS)),
           configured: p.configured ?? true,
           enabled: p.enabled !== false,
           disabledReason: p.disabledReason ?? null,
@@ -1068,7 +1071,7 @@ export function projectDevices(tenantId = null) {
         return {
           id: m.id, address: m.address, name: m.name,
           lastSeen: m.lastSeen ?? null,
-          active: isModuleActive(m, now),
+          active: isModuleActive(m, now, staleMsFor(d, STALE_MS)),
           configured: m.configured ?? true,
           status: deriveModuleStatus({
             portStatuses: ports.map((p) => p.status),
@@ -1164,7 +1167,7 @@ export async function removeDevice(dev) {
 export async function removeModule(dev, moduleId) {
   const mod = dev.modules.find((m) => m.id === moduleId || m._uuid === moduleId);
   if (!mod) { const e = new Error(`unknown module '${moduleId}'`); e.status = 404; throw e; }
-  if (isModuleActive(mod)) throw new ActiveHardwareError(`board '${mod.name}'`);
+  if (isModuleActive(mod, Date.now(), staleMsFor(dev, STALE_MS))) throw new ActiveHardwareError(`board '${mod.name}'`);
   await withTenant(dev._tenantUuid, (c) =>
     c.query('DELETE FROM modules WHERE module_id = $1', [mod._uuid]));
   dev.modules.splice(dev.modules.indexOf(mod), 1);
@@ -1176,7 +1179,7 @@ export async function removePort(dev, moduleId, portId) {
   if (!mod) { const e = new Error(`unknown module '${moduleId}'`); e.status = 404; throw e; }
   const port = mod.ports.find((p) => p.id === portId || p._uuid === portId);
   if (!port) { const e = new Error(`unknown port '${portId}'`); e.status = 404; throw e; }
-  if (isPortActive(port)) throw new ActiveHardwareError(`channel '${port.id}'`);
+  if (isPortActive(port, Date.now(), staleMsFor(dev, STALE_MS))) throw new ActiveHardwareError(`channel '${port.id}'`);
   await withTenant(dev._tenantUuid, (c) =>
     c.query('DELETE FROM ports WHERE port_id = $1', [port._uuid]));
   mod.ports.splice(mod.ports.indexOf(port), 1);

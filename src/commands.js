@@ -13,6 +13,7 @@
 //                         state:0|1        (mode=bin),
 //                         duty:0..255      (mode=pwm) }
 //   sensor_port_up|down { chip:0..3, ch:0..3 }
+//   set_interval        { ms:5000..3600000 }
 //
 // IMPORTANT — tid is the BROKER tenant string ("tenant-123"), NOT our slug
 // ("aquatech"). It must be resolved server-side from tenants.mqtt_tid; the
@@ -113,6 +114,18 @@ export function buildActuate({ tid, nid, port, mode, state, duty, dur = 0, cid, 
   return cmd;
 }
 
+// Branch D — telemetry interval (firmware 2026-10-29). The node applies it at
+// once, saves it per tenant, ACKs, then republishes disco with tlm_interval_ms.
+export const INTERVAL_MIN_MS = 5_000;
+export const INTERVAL_MAX_MS = 3_600_000;
+export function buildSetInterval({ tid, nid, ms, cid, ts }) {
+  const v = reqInt(ms, 'ms');
+  if (v < INTERVAL_MIN_MS || v > INTERVAL_MAX_MS) {
+    throw new Error(`ms must be ${INTERVAL_MIN_MS}..${INTERVAL_MAX_MS} (5 s – 1 h)`);
+  }
+  return { ...base('set_interval', { tid, nid, cid, ts }), ms: v };
+}
+
 // Branch C — sensor port mask toggle (up = enable, down = disable).
 export function buildSensorPortToggle({ tid, nid, direction, chip, ch, cid, ts }) {
   const dir = String(direction).toLowerCase();
@@ -137,9 +150,11 @@ export function buildCommand(action, ctx, params = {}) {
       return buildSensorPortToggle({ ...ctx, direction: 'up', ...params });
     case 'sensor_port_down':
       return buildSensorPortToggle({ ...ctx, direction: 'down', ...params });
+    case 'set_interval':
+      return buildSetInterval({ ...ctx, ...params });
     default:
       throw new Error(
-        `unknown action "${a}" — expected bus_recovery | actuate | sensor_port_up | sensor_port_down`
+        `unknown action "${a}" — expected bus_recovery | actuate | sensor_port_up | sensor_port_down | set_interval`
       );
   }
 }

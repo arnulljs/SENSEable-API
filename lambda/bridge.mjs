@@ -87,6 +87,8 @@ function collect(msgs, onMessage) {
 }
 
 async function ingestOne({ topic, payload, retain }) {
+  // Empty payload = a retained topic being cleared (node left this tenant).
+  if (!payload.length) return 'cleared';
   let pkt;
   try { pkt = JSON.parse(payload.toString()); } catch { return 'bad-json'; }
   // The firmware's LWT is just {"t":"lwt","status":…}; its topic always carries

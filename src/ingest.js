@@ -67,7 +67,11 @@ async function resolvePacketNode(pkt, { provision = true } = {}) {
     // Remember the tid this board really uses, so commands for a pinned node
     // go to the topic it subscribes to rather than its new tenant's tid.
     // Persisted (migration 018) so the cloud API can publish to it directly.
-    if (pkt.tid) persistWireTid(node, pkt.tid);
+    // Not from replayed rows (r:1): after a tenant change the node drains its
+    // old backlog under the OLD tid, and learning that would send commands to
+    // a topic the node no longer listens on.
+    const replayed = pkt.r === 1 || pkt.r === true;
+    if (pkt.tid && !replayed) persistWireTid(node, pkt.tid);
     return { node, scoped: true, error: null };
   }
 
@@ -397,6 +401,9 @@ const ACK_GROUNDED = new Set(['completed', 'stopped']);
 export async function ingestAck(pkt) {
   if (!pkt || pkt.t !== 'ack') return { ok: false, error: 'not an ack packet' };
   if (!pkt.cid) return { ok: false, error: 'ack missing cid' };
+  // Ping replies belong to the standalone latency listener, which never logs a
+  // command; ingesting them would warn "orphan ack" every 10 s.
+  if (pkt.action === 'ping') return { ok: true, ignored: 'ping' };
 
   const { node, scoped, error } = await resolvePacketNode(pkt);
   if (error) return { ok: false, error };
@@ -477,9 +484,12 @@ export async function ingestStatus(pkt, opts = {}) {
   }
   const online = raw === 'online';
 
-  const { node, scoped, error } = await resolvePacketNode(pkt);
-  if (error) return { ok: false, error };
-  if (!node) return { ok: false, error: `unknown node '${pkt.nid}' (tid '${pkt.tid}')` };
+  // Never provisions (same as config): status is retained, and on a tenant
+  // change the node leaves a retained 'offline' on the OLD tenant's topic. With
+  // provisioning on, that replay re-created a node the operator had removed.
+  // A status for a node we don't hold carries nothing to keep: ignored, not an error.
+  const { node, scoped, error } = await resolvePacketNode(pkt, { provision: false });
+  if (!node) return { ok: true, ignored: error ?? `unknown node '${pkt.nid}'` };
 
   node.lwtOnline = online;
   node.lwtAt = Date.now();
