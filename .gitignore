@@ -16,3 +16,6 @@ public/
 *.bak
 .env*
 !.env*.example
+
+# Latency listener output (scripts/latency-listener.js): thesis data, kept out of git
+latency-out/
