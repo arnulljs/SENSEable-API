@@ -116,7 +116,7 @@ export async function hydrate({ lite = false } = {}) {
       d.comm_mode, d.uptime_s, d.rssi, d.free_heap, d.last_seen, d.tlm_interval_ms, d.lwt_online,
       d.wire_tid,
       d.active_hw_mode, d.wifi_ssid, d.cell_apn, d.target_broker, d.last_config_sync,
-      d.last_reset, d.last_crash_step, d.last_crash_task, d.prev_uptime_s,
+      d.last_reset, d.last_crash_step, d.last_crash_task, d.prev_uptime_s, d.last_disconnect,
       t.tenant_id, t.slug AS tenant_slug,
       m.module_id, m.i2c_address, m.name AS module_name,
       m.last_seen AS module_last_seen, m.configured AS module_configured,
@@ -165,6 +165,7 @@ export async function hydrate({ lite = false } = {}) {
           broker: r.target_broker, syncedAt: new Date(r.last_config_sync).getTime(),
           reset: r.last_reset ?? null, crashStep: r.last_crash_step ?? null,
           crashTask: r.last_crash_task ?? null, prevUptimeS: r.prev_uptime_s ?? null,
+          lastDisconnect: r.last_disconnect ?? null,
         } : null,
         systemFault: 0,
         lastSeen: r.last_seen ? new Date(r.last_seen).getTime() : null,
@@ -543,10 +544,12 @@ export async function persistHwConfig(dev) {
     q.query(
       `UPDATE devices SET active_hw_mode=$2, wifi_ssid=$3, cell_apn=$4, target_broker=$5,
               last_config_sync=to_timestamp($6/1000.0),
-              last_reset=$7, last_crash_step=$8, last_crash_task=$9, prev_uptime_s=$10
+              last_reset=$7, last_crash_step=$8, last_crash_task=$9, prev_uptime_s=$10,
+              last_disconnect=$11
        WHERE device_id=$1`,
       [dev._uuid, c.mode, c.ssid, c.apn, c.broker, c.syncedAt,
-       c.reset ?? null, c.crashStep ?? null, c.crashTask ?? null, c.prevUptimeS ?? null]));
+       c.reset ?? null, c.crashStep ?? null, c.crashTask ?? null, c.prevUptimeS ?? null,
+       c.lastDisconnect ? JSON.stringify(c.lastDisconnect) : null]));
 }
 
 export async function persistLwt(dev, online) {
@@ -671,7 +674,7 @@ export async function recordCommand(dev, envelope) {
 
 // Update a command's lifecycle status from an incoming ack. Returns the cache
 // record (with .action/.port) so ingest can reflect it on the actuator.
-export async function updateCommandStatus(cid, status, msg, terminal = false, node = null) {
+async function findCommand(cid, node) {
   let rec = store.commands.find((c) => c.cid === cid);
   if (!rec && node) {
     rec = await loadCommandForNode(cid, node).catch((e) => {
@@ -679,6 +682,25 @@ export async function updateCommandStatus(cid, status, msg, terminal = false, no
       return null;
     });
   }
+  return rec ?? null;
+}
+
+// An ACK of any kind proves the node received the command, so it is never
+// sent again — even when the "published" stamp was lost (a publish that went
+// out from a run that ended before stamping it). The dispatcher only re-sends
+// rows with published_at NULL.
+export async function markCommandDelivered(cid, node) {
+  const rec = await findCommand(cid, node);
+  const t = rec ? store.tenants[rec.tenantId] : null;
+  if (!t) return null;
+  await withTenant(t.id, (c) =>
+    c.query('UPDATE commands SET published_at = coalesce(published_at, now()) WHERE cid = $1', [cid]))
+    .catch((e) => console.error('[store] mark delivered failed:', e.message));
+  return rec;
+}
+
+export async function updateCommandStatus(cid, status, msg, terminal = false, node = null) {
+  const rec = await findCommand(cid, node);
   if (rec) {
     rec.status = status;
     rec.msg = msg;
@@ -691,7 +713,8 @@ export async function updateCommandStatus(cid, status, msg, terminal = false, no
     withTenant(t.id, (c) =>
       c.query(
         `UPDATE commands
-         SET status=$2, msg=$3, acked_at = CASE WHEN $4 THEN now() ELSE acked_at END
+         SET status=$2, msg=$3, acked_at = CASE WHEN $4 THEN now() ELSE acked_at END,
+             published_at = coalesce(published_at, now())   -- any ACK = delivered; never re-send
          WHERE cid=$1`,
         [cid, status, msg, terminal]
       )).catch((e) => console.error('[store] persist ack failed:', e.message));

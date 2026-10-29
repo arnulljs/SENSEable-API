@@ -18,6 +18,13 @@
 //                    logged as a timeout.
 //   mqtt_events.csv  connects, drops, reconnects and errors, so a gap in the
 //                    other two files can be explained.
+//   chrony_tracking.txt  `chronyc tracking` (and `chronyc clients`) at start
+//                    and stop, the clock record the thesis needs (handover 5).
+//
+// Columns follow handover section 5. In tlm_latency.csv, analyse only rows
+// with first_copy=true; after_reconnect=true marks rows delivered within 10 s
+// of this listener reconnecting (a burst, not normal latency); dup is the MQTT
+// DUP flag.
 //
 // The receipt time is taken FIRST in the message handler, before parsing, so
 // nothing this script does is counted as network time. Retained and replayed
@@ -69,16 +76,31 @@ function csv(name, header) {
 const cell = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
 const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Number(v) : null);
 
-const writeTlm = csv('tlm_latency.csv', ['received_ms', 'received_iso', 'nid', 'tid', 'ts_ms', 'latency_ms',
-  'sync_age_s', 'net', 'rt', 'win_ms']);
-const writePing = csv('ping_rtt.csv', ['t0_ms', 'received_ms', 'nid', 'tid', 'cid', 'outcome', 'rtt_ms',
-  'downlink_ms', 'on_node_ms', 'uplink_ms', 'rx_ms', 'ts_ms', 'sync_age_s', 'net', 'rt']);
+const writeTlm = csv('tlm_latency.csv', ['recv_ms', 'nid', 'net', 'rt', 'ts_ms', 'latency_ms', 'sync_age_s',
+  'dup', 'first_copy', 'after_reconnect', 'tid', 'win_ms', 'recv_iso']);
+const writePing = csv('ping_rtt.csv', ['t0', 'recv_ms', 'rtt_ms', 'down_ms', 'up_ms', 'proc_ms', 'sync_age_s',
+  'net', 'rt', 'nid', 'tid', 'cid', 'outcome', 'rx_ms', 'ts_ms']);
 const writeEvent = csv('mqtt_events.csv', ['at_ms', 'at_iso', 'event', 'detail']);
 const event = (e, detail = '') => {
   const at = Date.now();
   writeEvent({ at_ms: at, at_iso: new Date(at).toISOString(), event: e, detail });
   console.log(`[${new Date(at).toISOString()}] ${e}${detail ? ` — ${detail}` : ''}`);
 };
+
+// ── Clock record: chronyc output at start and stop (handover 5) ──────────────
+function chronySnapshot(when) {
+  let text = `===== ${when} ${new Date().toISOString()} =====\n`;
+  for (const args of [['tracking'], ['clients']]) {
+    try {
+      text += `$ chronyc ${args.join(' ')}\n` + execFileSync('chronyc', args, { encoding: 'utf8', timeout: 5000 });
+    } catch (e) {
+      text += `$ chronyc ${args.join(' ')}\n(failed: ${String(e.stderr || e.message).trim().split('\n')[0]}` +
+              `${args[0] === 'clients' ? ' — run the listener with sudo, or record `sudo chronyc clients` by hand' : ''})\n`;
+    }
+  }
+  fs.appendFileSync(path.join(OUT, 'chrony_tracking.txt'), text + '\n');
+}
+chronySnapshot('start');
 
 // ── Laptop clock check: every latency row depends on it ─────────────────────
 try {
@@ -95,6 +117,9 @@ try {
 // ── State ────────────────────────────────────────────────────────────────────
 const nodes = new Map();      // nid → { tid, lastHeard }
 const pending = new Map();    // cid → { nid, tid, t0 }
+const seenTs = new Set();     // nid|ts_ms already logged → later copies are first_copy=false
+let lastConnectAt = 0;        // rows within 10 s of a (re)connect are flagged after_reconnect
+const AFTER_RECONNECT_MS = 10_000;
 const stats = { tlm: 0, tlmSkippedNoTs: 0, tlmSkippedOld: 0, pings: 0, pongs: 0, timeouts: 0 };
 const latencies = new Map();  // nid → [latency_ms]
 const rtts = new Map();       // nid → [rtt_ms]
@@ -108,8 +133,12 @@ const client = mqtt.connect(URL, {
   reconnectPeriod: 2000, connectTimeout: 15_000, keepalive: 30,
 });
 
+let connects = 0;
 client.on('connect', () => {
-  event('connected', clientId);
+  connects++;
+  // The very first connect is not a reconnect; every later one is.
+  if (connects > 1) lastConnectAt = Date.now();
+  event(connects > 1 ? 'reconnected' : 'connected', clientId);
   client.subscribe([`${BASE}/+/+/tlm`, `${BASE}/+/+/ack`], { qos: 1 }, (err, granted) => {
     const bad = err ? err.message : granted?.filter((g) => g.qos >= 128).map((g) => g.topic).join(' ');
     event(bad ? 'subscribe_failed' : 'subscribed', bad || `${BASE}/+/+/tlm, ${BASE}/+/+/ack`);
@@ -136,11 +165,16 @@ client.on('message', (topic, payload, packet) => {
     if (tsMs == null) { stats.tlmSkippedNoTs++; return; }   // node clock not SNTP-synced
     if (tsMs < Date.UTC(2026, 0, 1)) { stats.tlmSkippedOld++; return; }
     const latency = received - tsMs;
+    const key = `${nid}|${tsMs}`;
+    const firstCopy = !seenTs.has(key);
+    seenTs.add(key);
+    const afterReconnect = lastConnectAt > 0 && received - lastConnectAt <= AFTER_RECONNECT_MS;
     stats.tlm++;
-    push(latencies, nid, latency);
-    writeTlm({ received_ms: received, received_iso: new Date(received).toISOString(), nid, tid,
-               ts_ms: tsMs, latency_ms: latency, sync_age_s: num(pkt.sync_age_s), net: pkt.net,
-               rt: pkt.rt, win_ms: num(pkt.win_ms) });
+    if (firstCopy && !afterReconnect) push(latencies, nid, latency);   // summary uses clean rows only
+    writeTlm({ recv_ms: received, recv_iso: new Date(received).toISOString(), nid, tid, net: pkt.net, rt: pkt.rt,
+               ts_ms: tsMs, latency_ms: latency, sync_age_s: num(pkt.sync_age_s),
+               dup: packet.dup ? 'true' : 'false', first_copy: String(firstCopy),
+               after_reconnect: String(afterReconnect), win_ms: num(pkt.win_ms) });
     return;
   }
 
@@ -154,9 +188,9 @@ client.on('message', (topic, payload, packet) => {
     const rtt = received - t0;
     stats.pongs++;
     push(rtts, nid, rtt);
-    writePing({ t0_ms: t0, received_ms: received, nid, tid, cid: pkt.cid, outcome: 'reply', rtt_ms: rtt,
-                downlink_ms: rx != null ? rx - t0 : null, on_node_ms: rx != null && ts != null ? ts - rx : null,
-                uplink_ms: ts != null ? received - ts : null, rx_ms: rx, ts_ms: ts,
+    writePing({ t0, recv_ms: received, nid, tid, cid: pkt.cid, outcome: 'reply', rtt_ms: rtt,
+                down_ms: rx != null ? rx - t0 : null, proc_ms: rx != null && ts != null ? ts - rx : null,
+                up_ms: ts != null ? received - ts : null, rx_ms: rx, ts_ms: ts,
                 sync_age_s: num(pkt.sync_age_s), net: pkt.net, rt: pkt.rt });
   }
 });
@@ -182,7 +216,7 @@ function pingAll() {
     if (now - p.t0 > PING_TIMEOUT_MS) {
       pending.delete(cid);
       stats.timeouts++;
-      writePing({ t0_ms: p.t0, nid: p.nid, tid: p.tid, cid, outcome: 'timeout' });
+      writePing({ t0: p.t0, nid: p.nid, tid: p.tid, cid, outcome: 'timeout' });
     }
   }
 }
@@ -191,7 +225,7 @@ setInterval(pingAll, PING_MS);
 // ── Summary every minute and on exit ─────────────────────────────────────────
 const pct = (arr, q) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(q * s.length))]; };
 function summary() {
-  console.log(`\n${new Date().toISOString()}  tlm rows ${stats.tlm} (skipped: ${stats.tlmSkippedNoTs} without ts_ms, ` +
+  console.log(`\n${new Date().toISOString()}  (latency stats: first copies outside reconnect bursts)  tlm rows ${stats.tlm} (skipped: ${stats.tlmSkippedNoTs} without ts_ms, ` +
               `${stats.tlmSkippedOld} with an unset clock)  pings ${stats.pings} → ${stats.pongs} replies, ${stats.timeouts} timeouts`);
   for (const nid of new Set([...latencies.keys(), ...rtts.keys()])) {
     const l = latencies.get(nid) ?? [], r = rtts.get(nid) ?? [];
@@ -203,7 +237,8 @@ function summary() {
 setInterval(summary, 60_000);
 function stop() {
   // Pings still in flight are written too, so every ping sent is in the file.
-  for (const [cid, p] of pending) writePing({ t0_ms: p.t0, nid: p.nid, tid: p.tid, cid, outcome: 'no_reply_at_stop' });
+  for (const [cid, p] of pending) writePing({ t0: p.t0, nid: p.nid, tid: p.tid, cid, outcome: 'no_reply_at_stop' });
+  chronySnapshot('stop');
   summary(); event('stopped'); client.end(false, () => process.exit(0));
 }
 process.on('SIGINT', stop);

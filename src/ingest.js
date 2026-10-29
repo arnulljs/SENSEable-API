@@ -13,7 +13,7 @@
 import {
   store, findNode, findPortByChannel, pushHistory, persistLwt, persistWireTid, persistHwConfig,
   applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
-  updateCommandStatus, setActuatorAck, addNotification,
+  updateCommandStatus, markCommandDelivered, setActuatorAck, addNotification,
 } from './store.js';
 import { derivePortStatus, deriveNodeStatus, describeConnState, STALE_MS } from './status.js';
 import { ensureDeviceForTenant, ensureModule, ensurePort, touchPresence } from './provision.js';
@@ -458,6 +458,16 @@ export async function ingestAck(pkt) {
   if (status === 'failed' && /expired/i.test(text ?? '')) status = 'expired';
   const terminal = ACK_TERMINAL.has(status);
 
+  // "Command already executed; redelivery ignored" (handover 3.1) arrives as
+  // `completed` but says nothing about the command's outcome — only that the
+  // node got it again. Recording it as completed would end a timed actuation
+  // on the dashboard while the output is still running. It is a delivery
+  // receipt: stop re-sending, change nothing else.
+  if (/already executed/i.test(text ?? '')) {
+    await markCommandDelivered(pkt.cid, node);
+    return { ok: true, node: node.id, tenantScoped: scoped, redelivery: true };
+  }
+
   // 1. Update the command record (fire-and-forget persistence).
   const cmd = await updateCommandStatus(pkt.cid, status, text, terminal, node);
 
@@ -548,6 +558,27 @@ export async function ingestStatus(pkt, opts = {}) {
 // creates a device: a replay for a board someone deleted must not bring it back.
 const cfgStr = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
 
+// last_disconnect (handover 2.3): the node's last NETWORK outage, not a reboot.
+// Only known fields, bounded, so a malformed config can't put arbitrary JSON in
+// the devices row. null when absent (no outage since boot) or unusable.
+const cfgNum = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+function cleanDisconnect(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const out = {
+    cause: cfgStr(d.cause, 10)?.toLowerCase() ?? null,      // wifi | mqtt
+    reason: cfgStr(d.reason, 40),
+    reasonCode: Number.isInteger(d.reason_code) ? d.reason_code : null,
+    at: Number.isInteger(d.at) && d.at > 1_600_000_000 ? d.at : null,   // absent if the clock wasn't set
+    offlineS: cfgNum(d.offline_s),
+    rowsSpooled: Number.isInteger(d.rows_spooled) ? d.rows_spooled : null,
+  };
+  return Object.values(out).some((v) => v != null) ? out : null;
+}
+// Field by field: the copy loaded from jsonb has its keys in a different order.
+const DISCONNECT_KEYS = ['cause', 'reason', 'reasonCode', 'at', 'offlineS', 'rowsSpooled'];
+const sameDisconnect = (a, b) => (!a || !b) ? !a === !b
+  : DISCONNECT_KEYS.every((k) => (a[k] ?? null) === (b[k] ?? null));
+
 export async function ingestConfig(pkt) {
   if (!pkt || pkt.t !== 'config') return { ok: false, error: 'not a config packet' };
   const { node, scoped, error } = await resolvePacketNode(pkt, { provision: false });
@@ -569,6 +600,7 @@ export async function ingestConfig(pkt) {
     crashTask: cfgStr(pkt.last_task, 40),
     prevUptimeS: Number.isFinite(Number(pkt.prev_uptime_s)) && pkt.prev_uptime_s !== null
       ? Number(pkt.prev_uptime_s) : null,
+    lastDisconnect: cleanDisconnect(pkt.last_disconnect),
     syncedAt: clock.at.getTime(),
   };
   const prev = node.hwConfig;
@@ -576,6 +608,7 @@ export async function ingestConfig(pkt) {
     prev.apn === cfg.apn && prev.broker === cfg.broker &&
     prev.reset === cfg.reset && prev.crashStep === cfg.crashStep &&
     prev.crashTask === cfg.crashTask && prev.prevUptimeS === cfg.prevUptimeS &&
+    sameDisconnect(prev.lastDisconnect, cfg.lastDisconnect) &&
     // No usable ts: the receive time would differ on every replay, so keep the
     // first one rather than rewriting the row each minute.
     (!clock.trusted || prev.syncedAt === cfg.syncedAt);
