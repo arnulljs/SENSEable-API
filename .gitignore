@@ -22,3 +22,7 @@ latency-out/
 
 # TC-3.2 results (scripts/tc-3-2-isolation.mjs)
 tc-3-2-out/
+
+# test runs (scripts/latency-listener.js)
+runs/
+latency-*/
