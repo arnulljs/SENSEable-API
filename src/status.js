@@ -8,7 +8,11 @@
 // telemetry status codes are the default here:
 //
 //   0  NORMAL            healthy analog reading
-//   1  OPEN              floating pin / empty terminal (4500..5000 LSB window)
+//   1  NEAR_ZERO         window mean within ±5 counts of 0 V (firmware ±6.144 V
+//                        range). The firmware calls it "probably nothing
+//                        attached", but a real sensor at 0 V reads the same,
+//                        so it is a hint, not proof: a warning (amber), not
+//                        Offline — the port IS reporting.
 //   2  SATURATED         at least one sample in the window hit the ADC limit
 //                        (±32760). Since firmware 2026-10-28 a row is a window
 //                        average, so this is "clipped at some point", not a
@@ -19,7 +23,7 @@
 // --- Frozen telemetry status codes (adc[].p[] third element) ----------------
 const SCHEMA_CODES = {
   0: { name: 'NORMAL',           severity: 'normal'  },
-  1: { name: 'OPEN',             severity: 'offline' }, // unplugged / floating
+  1: { name: 'NEAR_ZERO',        severity: 'warning' }, // ≈0 V: unplugged, or a sensor at 0 V
   2: { name: 'SATURATED',        severity: 'warning' }, // clipped during the window
   3: { name: 'READ_FAILED',      severity: 'fault'   }, // every read failed (-9999)
 };
