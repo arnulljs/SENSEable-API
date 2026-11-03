@@ -1,0 +1,12 @@
+===== start 2026-11-03T07:52:11.170Z =====
+$ chronyc tracking
+(failed: spawnSync chronyc ENOENT)
+$ chronyc clients
+(failed: spawnSync chronyc ENOENT — run the listener with sudo, or record `sudo chronyc clients` by hand)
+
+===== stop 2026-11-03T07:55:11.283Z =====
+$ chronyc tracking
+(failed: spawnSync chronyc ENOENT)
+$ chronyc clients
+(failed: spawnSync chronyc ENOENT — run the listener with sudo, or record `sudo chronyc clients` by hand)
+

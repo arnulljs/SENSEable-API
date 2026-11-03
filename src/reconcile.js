@@ -50,6 +50,7 @@
 import { recordCommand, commandTidFor, refreshConfig } from './store.js';
 import { buildCommand, cmdTopic, CHIP_ADDRS } from './commands.js';
 import { publishCommand } from './mqtt.js';
+import { IS_BRIDGE, observedRoute } from './role.js';
 
 // Don't re-issue the same correction faster than this. A node that is ignoring
 // the command (wrong firmware, dead I2C bus) would otherwise get a fresh one on
@@ -82,6 +83,16 @@ export function getReconcileStats() {
  * packet itself is still good information.
  */
 export async function reconcileNode(node, pkt) {
+  // Only the tier holding the operator's CURRENT intent may correct the node.
+  // That intent lives in the cloud database (the dashboard writes there); the
+  // edge has a copy the sync worker refreshes every 30 s, or never if the
+  // worker is down. An edge reconciling on the cloud route therefore fought
+  // the dashboard: ports switched ON on Vercel were "corrected" back OFF on
+  // every discovery until the copy caught up (seen 2026-11-03, NODE-1BC478).
+  // So: the bridge (Lambda) reconciles on the cloud route; the edge only while
+  // the node is failed over to the local broker, where the cloud can't reach.
+  if (!IS_BRIDGE && observedRoute() !== 'ROUTE_LOCAL_FAILOVER') return [];
+
   // Act on the operator's CURRENT intent, not the copy loaded at boot: a
   // dashboard edit made on the other tier may have arrived through the sync
   // since then. Without this, reconcile "corrected" a channel the operator had

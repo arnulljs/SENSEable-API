@@ -1,0 +1,8 @@
+at_ms,at_iso,event,detail
+1793692331238,2026-11-03T07:52:11.238Z,clock_check,NTPSynchronized=yes
+1793692332370,2026-11-03T07:52:12.370Z,connected,senseable-latency-Arnold-Mint-1ca85e
+1793692332610,2026-11-03T07:52:12.610Z,subscribed,"usc/thesis/+/+/tlm, usc/thesis/+/+/ack, usc/thesis/+/+/cmd"
+1793692333104,2026-11-03T07:52:13.104Z,api_signed_in,mariz@aquatech.ph
+1793692511286,2026-11-03T07:55:11.286Z,stopped,
+1793692511302,2026-11-03T07:55:11.302Z,error,client disconnecting
+1793692511544,2026-11-03T07:55:11.544Z,closed,
