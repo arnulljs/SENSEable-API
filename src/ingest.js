@@ -13,7 +13,7 @@
 import {
   store, findNode, findPortByChannel, pushHistory, persistLwt, persistWireTid, persistHwConfig,
   applyCalibration, persistDeviceState, persistPortActive, persistTlmInterval,
-  updateCommandStatus, markCommandDelivered, setActuatorAck, addNotification,
+  updateCommandStatus, markCommandDelivered, setActuatorAck, applyOutputStates, addNotification,
 } from './store.js';
 import { derivePortStatus, deriveNodeStatus, describeConnState, STALE_MS } from './status.js';
 import { ensureDeviceForTenant, ensureModule, ensurePort, touchPresence } from './provision.js';
@@ -585,6 +585,12 @@ export async function ingestConfig(pkt) {
   if (error) return { ok: false, error };
   if (!node) return { ok: true, ignored: `unknown node '${pkt.nid}'` };
 
+  // Output states (firmware 2026-11-04): sent on every connect and after every
+  // output change. Applied BEFORE the unchanged check below, which compares only
+  // the hardware fields: a config whose only change is an output is not a repeat.
+  // Config is never spooled or replayed, so this is always the current state.
+  const outputsChanged = Array.isArray(pkt.outputs) ? applyOutputStates(node, pkt.outputs) : 0;
+
   const clock = sampleTime(pkt);
   const cfg = {
     mode: cfgStr(pkt.active_hw_mode, 20)?.toUpperCase() ?? null,
@@ -612,11 +618,11 @@ export async function ingestConfig(pkt) {
     // No usable ts: the receive time would differ on every replay, so keep the
     // first one rather than rewriting the row each minute.
     (!clock.trusted || prev.syncedAt === cfg.syncedAt);
-  if (unchanged) return { ok: true, node: node.id, tenantScoped: scoped, changed: false };
+  if (unchanged) return { ok: true, node: node.id, tenantScoped: scoped, changed: outputsChanged > 0, outputsChanged };
 
   node.hwConfig = cfg;
   persistHwConfig(node).catch((e) => console.error('[ingest] persist config failed:', e.message));
-  return { ok: true, node: node.id, tenantScoped: scoped, changed: true };
+  return { ok: true, node: node.id, tenantScoped: scoped, changed: true, outputsChanged };
 }
 
 // Recompute one node's status from its ports + staleness.

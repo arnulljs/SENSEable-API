@@ -7,6 +7,7 @@
 //   node scripts/latency-listener.js                          all nodes it hears
 //   node scripts/latency-listener.js --nodes NODE-1BC478 --duration-min 180
 //   node scripts/latency-listener.js --nodes NODE-1BC478 --cmd 50 --cmd-actuator out1
+//   node scripts/latency-listener.js --nodes NODE-1BC478 --cmd 10 --cmd-dur-ms 10000 --cmd-gap-s 20
 //
 // WHAT IT MEASURES (every hop, on the cloud-first path)
 //
@@ -32,6 +33,11 @@
 //                        ON, … on --cmd-actuator, --cmd-gap-s apart, OFF last),
 //                        timed at each step: Vercel response, command on the
 //                        broker, first ACK, ACK visible through /api/commands.
+//                        With --cmd-dur-ms D every command is instead a timed ON
+//                        of D ms, and the node's auto-off is timed too (TC-3.4
+//                        shutoff accuracy). The node's own ACK timing (firmware
+//                        2026-11-04: rx_ms arrival, act_ms output switched,
+//                        ts_ms ACK sent, t0 echoed) splits the path further.
 //                        It switches a real output: leave it unwired or on a
 //                        safe load.
 //
@@ -75,6 +81,8 @@ const DURATION_MS = Number(arg('duration-min', '0')) * 60_000;
 const CMD_N = Number(arg('cmd', '0'));
 const CMD_ACT = arg('cmd-actuator', 'out1');
 const CMD_GAP_MS = Number(arg('cmd-gap-s', '10')) * 1000;
+const CMD_DUR_MS = Number(arg('cmd-dur-ms', '0'));
+const STALE_PING_MS = 5000;                 // a reply later than this is a queued burst, not latency
 const PING_TIMEOUT_MS = 30_000;
 const DB_WAIT_MS = 10 * 60_000;             // a row not in the database after this counts as missing
 const NODE_IDLE_MS = 5 * 60_000;            // stop pinging a node not heard from in 5 min
@@ -90,6 +98,9 @@ if (!URL || !E.LATENCY_MQTT_USERNAME || !E.LATENCY_MQTT_PASSWORD) {
   process.exit(2);
 }
 if (!(PING_MS >= 1000) || !(POLL_MS >= 500)) { console.error('--ping-s must be ≥ 1 and --api-poll-s ≥ 0.5'); process.exit(2); }
+if (CMD_DUR_MS && !(CMD_DUR_MS >= 100 && CMD_GAP_MS >= CMD_DUR_MS + 5000)) {
+  console.error('--cmd-dur-ms must be ≥ 100, and --cmd-gap-s must leave ≥ 5 s after the auto-off'); process.exit(2);
+}
 if (CMD_N && (!BACKEND || !ONLY || ONLY.size !== 1)) {
   console.error('--cmd needs the LATENCY_API_* settings and exactly one --nodes NODE-ID'); process.exit(2);
 }
@@ -113,7 +124,7 @@ const num = (v) => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Numbe
 const writeTlm = csv('tlm_latency.csv', ['recv_ms', 'nid', 'net', 'rt', 'ts_ms', 'latency_ms', 'sync_age_s',
   'dup', 'first_copy', 'after_reconnect', 'tid', 'win_ms', 'recv_iso']);
 const writePing = csv('ping_rtt.csv', ['t0', 'recv_ms', 'rtt_ms', 'down_ms', 'up_ms', 'proc_ms', 'sync_age_s',
-  'net', 'rt', 'nid', 'tid', 'cid', 'outcome', 'rx_ms', 'ts_ms']);
+  'net', 'rt', 'nid', 'tid', 'cid', 'outcome', 'rx_ms', 'ts_ms', 'stale']);
 const writeEvent = csv('mqtt_events.csv', ['at_ms', 'at_iso', 'event', 'detail']);
 const events = [];
 const event = (e, detail = '') => {
@@ -162,7 +173,7 @@ const tlmRows = [];           // live first copies, one per telemetry message
 const byWindow = new Map();   // nid|ts (s) → tlm row, for matching database rows
 const pingRows = [];
 const cmdSeen = new Map();    // cid → when the command crossed the broker
-const ackSeen = new Map();    // cid → { first, firstStatus, last, lastStatus }
+const ackSeen = new Map();    // cid → { first, firstStatus, last, lastStatus, byStatus: {status → timing} }
 
 const clientId = `senseable-latency-${os.hostname()}-${randomUUID().slice(0, 6)}`;
 const client = mqtt.connect(URL, {
@@ -232,9 +243,13 @@ client.on('message', (topic, payload, packet) => {
 
   if (kind === 'ack') {
     if (pkt.cid && pkt.action !== 'ping') {        // ⑤: any command's ACKs, by cid
-      const a = ackSeen.get(pkt.cid);
-      if (!a) ackSeen.set(pkt.cid, { first: received, firstStatus: pkt.status, last: received, lastStatus: pkt.status });
-      else { a.last = received; a.lastStatus = pkt.status; }
+      let a = ackSeen.get(pkt.cid);
+      if (!a) ackSeen.set(pkt.cid, a = { first: received, firstStatus: pkt.status, byStatus: {} });
+      a.last = received; a.lastStatus = pkt.status;
+      // Firmware 2026-11-04: started/stopped/completed carry port, the t0 echo
+      // and, once the node's clock is synced, rx_ms / act_ms / ts_ms.
+      a.byStatus[pkt.status] ??= { recv: received, port: num(pkt.port), t0: num(pkt.t0), rx_ms: num(pkt.rx_ms),
+                                   act_ms: num(pkt.act_ms), ts_ms: num(pkt.ts_ms), sync_age_s: num(pkt.sync_age_s) };
     }
     if (pkt.action !== 'ping') return;
     const p = pending.get(pkt.cid);
@@ -244,7 +259,12 @@ client.on('message', (topic, payload, packet) => {
     const t0 = num(pkt.t0) ?? p.t0;
     const rx = num(pkt.rx_ms), ts = num(pkt.ts_ms);
     stats.pongs++;
+    // A reply this late was queued somewhere (node offline, reconnect burst):
+    // kept in the file, left out of the statistics. A reply without rx_ms is
+    // NOT stale: the node's clock just isn't synced yet, and its round trip,
+    // on this laptop's clock alone, is still valid.
     const row = { t0, recv_ms: received, nid, tid, cid: pkt.cid, outcome: 'reply', rtt_ms: received - t0,
+                  stale: received - t0 > STALE_PING_MS,
                   down_ms: rx != null ? rx - t0 : null, proc_ms: rx != null && ts != null ? ts - rx : null,
                   up_ms: ts != null ? received - ts : null, rx_ms: rx, ts_ms: ts,
                   sync_age_s: num(pkt.sync_age_s), net: pkt.net, rt: pkt.rt };
@@ -270,7 +290,10 @@ function pingAll() {
     stats.pings++;
     client.publish(`${BASE}/${tid}/${nid}/cmd`,
       JSON.stringify({ t: 'cmd', v: 1, tid, nid, cid, ts: Math.floor(t0 / 1000), action: 'ping', t0 }),
-      { qos: 1 });
+      // QoS 0: HiveMQ must not queue pings for an offline node and deliver them
+      // as a burst on reconnect. A ping sent while the node is away is lost,
+      // which is the truth. (The node still replies at QoS 1.)
+      { qos: 0 });
   }
   for (const [cid, p] of pending) {
     if (now - p.t0 > PING_TIMEOUT_MS) {
@@ -387,15 +410,16 @@ async function commandTest() {
   for (let i = 0; i < 60 && !deviceIds.has(nid) && running; i++) await sleep(1000);
   const deviceId = deviceIds.get(nid);
   if (!deviceId) { event('cmd_test_skipped', `${nid} not found in /api/devices`); return; }
-  event('cmd_test_start', `${CMD_N} commands to ${deviceId} ${CMD_ACT}, ${CMD_GAP_MS / 1000} s apart`);
-  const send = (state) => api('POST', 'commands',
-    { deviceId, action: 'actuate', actuatorId: CMD_ACT, mode: 'bin', state, dur: 0 }, 'POST /api/commands');
+  event('cmd_test_start', `${CMD_N} commands to ${deviceId} ${CMD_ACT}, ${CMD_GAP_MS / 1000} s apart` +
+        (CMD_DUR_MS ? `, each a timed ON of ${CMD_DUR_MS} ms` : ', alternating ON/OFF'));
+  const send = (state, dur = 0) => api('POST', 'commands',
+    { deviceId, action: 'actuate', actuatorId: CMD_ACT, mode: 'bin', state, dur }, 'POST /api/commands');
   let last = 0;
   for (let i = 0; i < CMD_N && running; i++) {
-    const state = i % 2 === 0 ? 1 : 0;
-    last = state;
-    const r = await send(state);
-    const row = { i: i + 1, state, click_ms: r.t1, post_status: r.status, post_ms: r.t4 - r.t1,
+    const state = CMD_DUR_MS ? 1 : i % 2 === 0 ? 1 : 0;
+    last = CMD_DUR_MS ? 0 : state;                 // a timed ON switches itself off
+    const r = await send(state, CMD_DUR_MS);
+    const row = { i: i + 1, state, dur_ms: CMD_DUR_MS, click_ms: r.t1, post_status: r.status, post_ms: r.t4 - r.t1,
                   cid: r.json?.cid ?? null, published: r.json?.published ?? null };
     cmdRows.push(row);
     if (!row.cid) { row.error = r.json?.error ?? `HTTP ${r.status}`; await sleep(CMD_GAP_MS); continue; }
@@ -444,10 +468,20 @@ function buildReport() {
   }));
   const at = new Map(tlmRows.map((r, i) => [r, i]));
   const T = (rows, k) => rows.map((r) => tlm[at.get(r)][k]);
-  const replies = pingRows.filter((p) => p.outcome === 'reply');
+  const replies = pingRows.filter((p) => p.outcome === 'reply' && !p.stale);
+  let lastStarted = null;   // act_ms of the previous 'started' on the test port (manual on-time)
   const cmds = cmdRows.map((c) => {
     const broker = c.cid ? cmdSeen.get(c.cid) ?? null : null;
     const ack = c.cid ? ackSeen.get(c.cid) : null;
+    // The ACK that answers this command: started (ON) or stopped (OFF). Its
+    // node timing exists only once the node's clock is synced this boot.
+    const a = ack?.byStatus.started ?? ack?.byStatus.stopped ?? null;
+    const done = ack?.byStatus.completed ?? null;
+    let onTime = null;
+    if (ack?.byStatus.started?.act_ms != null) lastStarted = ack.byStatus.started.act_ms;
+    else if (ack?.byStatus.stopped?.act_ms != null && lastStarted != null) {
+      onTime = ack.byStatus.stopped.act_ms - lastStarted; lastStarted = null;
+    }
     return {
       i: c.i, state: c.state, cid: c.cid, http: c.post_status, published_immediately: c.published, error: c.error ?? null,
       vercel_response_ms: c.post_ms,
@@ -458,6 +492,18 @@ function buildReport() {
       click_to_ack_ms: ack ? ack.first - c.click_ms : null,
       click_to_ack_in_api_ms: c.api_ack_seen_ms != null ? c.api_ack_seen_ms - c.click_ms : null,
       final_status: c.final_status ?? null,
+      // Node timing (firmware 2026-11-04). t0 is Vercel's clock, rx/act/ts the
+      // node's (SNTP), recv this laptop's (NTP).
+      vercel_to_node_ms: a?.rx_ms != null && a?.t0 != null ? a.rx_ms - a.t0 : null,
+      node_rx_to_output_ms: a?.rx_ms != null && a?.act_ms != null ? a.act_ms - a.rx_ms : null,
+      ack_send_to_broker_ms: a?.ts_ms != null ? a.recv - a.ts_ms : null,
+      click_to_output_ms: a?.act_ms != null ? a.act_ms - c.click_ms : null,
+      on_time_ms: onTime,
+      auto_off_ms: done?.act_ms != null && ack?.byStatus.started?.act_ms != null ? done.act_ms - ack.byStatus.started.act_ms : null,
+      auto_off_error_ms: c.dur_ms && done?.act_ms != null && ack?.byStatus.started?.act_ms != null
+        ? done.act_ms - ack.byStatus.started.act_ms - c.dur_ms : null,
+      dur_ms: c.dur_ms, node_port: a?.port ?? null, t0: a?.t0 ?? null, rx_ms: a?.rx_ms ?? null, act_ms: a?.act_ms ?? null,
+      ack_ts_ms: a?.ts_ms ?? null, completed_act_ms: done?.act_ms ?? null, node_sync_age_s: a?.sync_age_s ?? null,
       click_ms: c.click_ms, broker_ms: broker, ack_ms: ack?.first ?? null, db_acked_at_ms: c.db_acked_at_ms ?? null,
     };
   });
@@ -489,11 +535,20 @@ function buildReport() {
     metric('5a', 'Dashboard command: Vercel response (POST /api/commands)', 'laptop only', postPolls),
     metric('5b', 'Dashboard command: click → command on broker', 'laptop only', C('click_to_broker_ms')),
     metric('5c', 'Dashboard command: broker → node ACK', 'laptop only', C('broker_to_ack_ms'),
-      'ACKs leave through the node\'s MQTT outbox (up to ~1 s): an upper bound on actuation'),
+      'round trip broker → node → broker; row 5h is the time on the node alone'),
     metric('5d', 'Dashboard command: ACK → database (Lambda)', 'laptop + Supabase', C('ack_to_db_ms')),
     metric('5e', 'Dashboard command: click → ACK at broker', 'laptop only', C('click_to_ack_ms')),
     metric('5f', 'Dashboard command: click → ACK visible in Vercel', 'laptop only', C('click_to_ack_in_api_ms'),
       'what the dashboard can show as "done"; ± 1 s poll'),
+    metric('5g', 'Dashboard command: Vercel → node (rx_ms − t0)', 'Vercel + node', C('vercel_to_node_ms'),
+      't0 is stamped by Vercel when the command is built; needs the node clock synced'),
+    metric('5h', 'Node: command received → output switched (act_ms − rx_ms)', 'node only', C('node_rx_to_output_ms'),
+      'the real actuation latency on the node'),
+    metric('5i', 'Node ACK sent → broker (recv − ts_ms)', 'node + laptop', C('ack_send_to_broker_ms')),
+    metric('5j', 'Dashboard command: click → output switched (act_ms − click)', 'laptop + node', C('click_to_output_ms'),
+      'end to end, button press to the output physically changing'),
+    metric('5k', 'Auto-off error (completed act_ms − started act_ms − dur)', 'node only', C('auto_off_error_ms'),
+      'TC-3.4 shutoff accuracy; only with --cmd-dur-ms'),
   ];
   const counts = {
     telemetry_messages: stats.tlm, live_first_copies: tlmRows.length, after_reconnect: tlmRows.length - clean.length,
@@ -502,13 +557,16 @@ function buildReport() {
     not_in_database: tlmRows.filter((r) => /^not in|^node not/.test(r.db)).length,
     still_waiting: tlmRows.filter((r) => r.db === 'waiting').length,
     pings_sent: stats.pings, ping_replies: stats.pongs, ping_timeouts: stats.timeouts,
+    ping_replies_stale: pingRows.filter((p) => p.stale).length,
     ping_loss_pct: stats.pings ? r1((100 * stats.timeouts) / stats.pings) : null,
     api_requests: apiPolls.length, api_errors: apiPolls.filter((p) => p.status !== 200 && p.status !== 201).length,
     commands_sent: cmds.length, commands_acked: cmds.filter((c) => c.ack_ms != null).length,
   };
   const meta = {
     started: STARTED.toISOString(), updated: new Date().toISOString(), host: os.hostname(), client_id: clientId,
-    nodes: ONLY ? [...ONLY] : [...nodes.keys()], ping_s: PING_MS / 1000, api_poll_s: POLL_MS / 1000,
+    nodes: ONLY ? [...ONLY] : [...nodes.keys()], ping_s: PING_MS / 1000, ping_qos: 0,
+    ping_stale_after_ms: STALE_PING_MS, api_poll_s: POLL_MS / 1000,
+    cmd_test: CMD_N ? `${CMD_N} × ${CMD_ACT}, ${CMD_GAP_MS / 1000} s apart${CMD_DUR_MS ? `, timed ${CMD_DUR_MS} ms` : ', ON/OFF'}` : 'off',
     api: BACKEND ? API : 'off (no LATENCY_API_* settings)', laptop_ntp_synchronized: ntpSynced,
     supabase_clock_offset_ms: r1(off), units: 'milliseconds unless the column says otherwise',
   };
@@ -606,7 +664,11 @@ function summary() {
     console.log(`  ② broker → database    ${show('2')}`);
     console.log(`  ③ broker → API visible ${show('3b')}`);
     console.log(`    API response         ${show('3d')}`);
-    if (CMD_N) console.log(`  ⑤ click → ACK in API   ${show('5f')}`);
+    if (CMD_N) {
+      console.log(`  ⑤ click → ACK in API   ${show('5f')}`);
+      console.log(`    click → output       ${show('5j')}`);
+      if (CMD_DUR_MS) console.log(`    auto-off error       ${show('5k')}`);
+    }
   }
   console.log(`  report: ${REPORT}.xlsx\n`);
 }

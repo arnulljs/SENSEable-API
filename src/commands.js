@@ -82,7 +82,12 @@ export function buildActuate({ tid, nid, port, mode, state, duty, dur = 0, cid, 
   const d = reqInt(dur, 'dur');
   if (d < 0) throw new Error('dur must be >= 0 (0 = hold indefinitely)');
 
-  const cmd = { ...base('actuate', { tid, nid, cid, ts }), port: p, mode: m, dur: d };
+  // t0 (Unix ms) is when the command was built, i.e. when the operator pressed
+  // the button. The firmware echoes it as-is on started/stopped/completed ACKs
+  // (2026-11-04), next to rx_ms (arrival), act_ms (output switched) and ts_ms
+  // (ACK sent), so rx_ms − t0 is dashboard → node. It is not validated; command
+  // age is still checked against ts.
+  const cmd = { ...base('actuate', { tid, nid, cid, ts }), port: p, mode: m, dur: d, t0: Date.now() };
 
   if (m === 'bin') {
     const s = reqInt(state, 'state');

@@ -755,6 +755,32 @@ export function applyActuatorCommand(node, idOrPort, out = {}) {
   return act;
 }
 
+// The node's own report of its outputs (config.outputs, firmware 2026-11-04):
+// all 8, in order, {port, mode:"bin", state} or {port, mode:"pwm", duty}. It is
+// the REAL state and overrides whatever was last commanded: after a reboot every
+// output is off, whatever the dashboard last sent. Only mode/state/duty change;
+// last_ack is the command's progress (pending/started/…), which the ACKs own.
+// `mode` is the last commanded mode, so a pwm output switched off stays pwm with
+// duty 0. Returns how many actuators changed.
+export function applyOutputStates(node, outputs) {
+  let changed = 0;
+  for (const o of outputs) {
+    const port = Number(o?.port);
+    if (!Number.isInteger(port) || port < 1 || port > 8) continue;
+    const act = findActuator(node, port);
+    if (!act) continue;
+    const mode = o.mode === 'pwm' ? 'pwm' : 'bin';
+    const duty = mode === 'pwm' ? Math.min(255, Math.max(0, Math.round(Number(o.duty) || 0))) : act.duty;
+    const state = mode === 'pwm' ? (duty > 0 ? 1 : 0) : (Number(o.state) ? 1 : 0);
+    if (act.mode === mode && act.state === state && act.duty === duty) continue;
+    Object.assign(act, { mode, state, duty, updatedAt: Date.now() });
+    persistActuator(node, act).catch((e) =>
+      console.error('[store] persist actuator failed:', e.message));
+    changed++;
+  }
+  return changed;
+}
+
 async function persistActuator(node, act) {
   await withTenant(node._tenantUuid, (c) =>
     c.query(
