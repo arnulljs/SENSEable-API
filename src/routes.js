@@ -14,6 +14,7 @@
 //                           NODE-TENANT-OVERRIDE: bench-only node -> tenant pin.
 
 import { Router } from 'express';
+import { adminPool } from '../db/pool.js';
 import {
   store, projectDevices,
   markNotificationRead, markAllNotificationsRead,
@@ -378,6 +379,57 @@ router.post('/commands', wrap(async (req, res) => {
     envelope,
     command: record,
   });
+}));
+
+// --- Readings export (mirror of SENSEable/api/_read.js readReadings) --------
+// The edge reads its own database: the same rows, synced from the cloud.
+// Readings of ONE port over a time range, oldest first, for "Export data".
+// ?device=slug:NODE-…&module=0x48&port=A0&since=<ISO>&until=<ISO> (until
+// defaults to now). Capped at READINGS_EXPORT_CAP rows; `truncated` says so.
+const EXPORT_CAP = Number(process.env.READINGS_EXPORT_CAP ?? 50_000);
+async function readReadings(client, { tenantSlug = null, device, module, port, since, until } = {}) {
+  const nodeId = String(device ?? '').split(':').slice(1).join(':');
+  const from = new Date(since), to = until ? new Date(until) : new Date();
+  if (!nodeId || !module || !port || Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+    const e = new Error('device, module, port and since (ISO time) are required'); e.status = 400; throw e;
+  }
+  const params = [nodeId, module, port, from.toISOString(), to.toISOString(), EXPORT_CAP + 1];
+  let scope = '';
+  if (tenantSlug) { params.push(tenantSlug); scope = `AND t.slug = $${params.length}`; }
+  const { rows } = await client.query(`
+    SELECT r.ts, r.value, r.raw_adc, r.status, r.code, r.n, r.win_ms,
+           r.value_min, r.value_max, r.raw_min, r.raw_max, r.origin, r.received_at
+      FROM readings r
+      JOIN ports p   ON p.port_id = r.port_id
+      JOIN modules m ON m.module_id = p.module_id
+      JOIN devices d ON d.device_id = m.device_id
+      JOIN tenants t ON t.tenant_id = d.tenant_id
+     WHERE d.node_id = $1 AND m.i2c_address = $2 AND p.port_code = $3
+       AND r.ts >= $4 AND r.ts <= $5 ${scope}
+     ORDER BY r.ts ASC
+     LIMIT $6`, params);
+  const truncated = rows.length > EXPORT_CAP;
+  return {
+    device, module, port, from: from.toISOString(), to: to.toISOString(),
+    count: Math.min(rows.length, EXPORT_CAP), truncated,
+    readings: rows.slice(0, EXPORT_CAP).map((r) => ({
+      timestamp: new Date(r.ts).toISOString(),
+      value: r.value == null ? null : Number(r.value), raw: r.raw_adc == null ? null : Number(r.raw_adc),
+      status: r.status, code: r.code, n: r.n, winMs: r.win_ms,
+      min: r.value_min == null ? null : Number(r.value_min), max: r.value_max == null ? null : Number(r.value_max),
+      rawMin: r.raw_min, rawMax: r.raw_max, source: r.origin,
+      receivedAt: r.received_at ? new Date(r.received_at).toISOString() : null,
+    })),
+  };
+}
+
+router.get('/readings', wrap(async (req, res) => {
+  try {
+    res.json(await readReadings(adminPool, { tenantSlug: tenantOf(req), ...req.query }));
+  } catch (e) {
+    if (e.status) return res.status(e.status).json({ error: e.message });
+    throw e;
+  }
 }));
 
 router.get('/commands', (req, res) => {
